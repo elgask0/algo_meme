@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Ingest Orderbook",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/ingest_coinapi.py",
+      "console": "integratedTerminal",
+      "args": ["--orderbook", "--symbol", "MEXCFTS_PERP_SPX_USDT"]
+    },
+    {
+      "name": "Python: Ingest Funding",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/ingest_coinapi.py",
+      "console": "integratedTerminal",
+      "args": ["--funding"]
+    }
+  ]
+}
