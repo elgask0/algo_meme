@@ -1,3 +1,5 @@
 {
-    "sqltools.useNodeRuntime": true
+    "sqltools.useNodeRuntime": true,
+
+    "sqlite-viewer.maxFileSize": 3000000000
 }

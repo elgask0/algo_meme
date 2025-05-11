@@ -2,9 +2,9 @@ import os
 import time
 import pandas as pd
 import requests
+from requests.exceptions import HTTPError
 import sqlite3
 import argparse
-from tqdm import tqdm
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +20,7 @@ def mexc_api_symbol(symbol_id: str) -> str:
     (ej. 'SPX_USDT'). Si el símbolo no lleva el prefijo, se devuelve tal cual.
     """
     return symbol_id[len(MEXC_PERP_PREFIX):] if symbol_id.startswith(MEXC_PERP_PREFIX) else symbol_id
+
 
 def fetch_mexc_funding_rate_history(symbol: str, page_size: int = 1000) -> list:
     """
@@ -41,6 +42,7 @@ def fetch_mexc_funding_rate_history(symbol: str, page_size: int = 1000) -> list:
             break
         page += 1
     return all_records
+
 
 def ingest_mexc_funding(symbol: str, conn, cur):
     """
@@ -85,25 +87,43 @@ API_KEY  = os.getenv('COINAPI_KEY')
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 DB_FILE  = os.path.join(BASE_DIR, 'trading_data.db')
 
-# Initialize a persistent HTTP session to reuse connections and set API key header
 session = requests.Session()
 session.headers.update({"X-CoinAPI-Key": API_KEY})
 
-def safe_get(url, params=None, retries=2, delay=0.5):
+# Delay between CoinAPI requests to respect rate limits
+RATE_LIMIT_DELAY = 0.5  # seconds
+
+def safe_get(url, params=None, retries=3, delay=0.5):
     """
-    Llama a session.get con reintentos exponenciales ante fallos transitorios.
+    Llama a session.get con reintentos exponenciales y maneja código 429 (Too Many Requests).
     """
     for attempt in range(retries):
+        # Espacio fijo entre peticiones para no superar el rate limit
+        time.sleep(RATE_LIMIT_DELAY)
         try:
             resp = session.get(url, params=params)
             resp.raise_for_status()
             return resp
+        except HTTPError as e:
+            status = e.response.status_code if e.response else None
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After")
+                # Si viene cabecera Retry-After la usamos; si no, usamos tiempo exponencial
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else delay
+                print(f"[CoinAPI] Rate limit hit (429). Retrying after {wait} seconds.")
+                time.sleep(wait)
+                delay *= 2
+                continue
+            # Para otros HTTP errors, relanzar
+            raise
         except Exception as e:
             if attempt < retries - 1:
+                print(f"[CoinAPI] Transient error ({e}). Retrying in {delay} seconds.")
                 time.sleep(delay)
                 delay *= 2
             else:
                 raise
+
 
 def fetch_symbol_info(symbol: str) -> dict:
     """
@@ -113,7 +133,8 @@ def fetch_symbol_info(symbol: str) -> dict:
     params = {"filter_symbol_id": symbol}
     resp   = safe_get(url, params=params)
     data   = resp.json()
-    return data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+    return data[0] if isinstance(data, list) and data else {}
+
 
 def ingest_symbol_info(symbol: str, conn, cur):
     """
@@ -147,6 +168,88 @@ def ingest_symbol_info(symbol: str, conn, cur):
     )
     conn.commit()
     print(f"[CoinAPI] Metadata actualizada para {symbol}")
+
+
+def fetch_ohlcv_5min(symbol: str, time_start: str, time_end: str, period_id: str = "5MIN") -> pd.DataFrame:
+    """
+    Descarga OHLCV para un símbolo entre dos fechas (ISO strings) con period_id variable.
+    """
+    url = (
+        f"https://rest.coinapi.io/v1/ohlcv/{symbol}/history"
+        f"?period_id={period_id}"
+        f"&time_start={time_start}&time_end={time_end}"
+        f"&limit=1000&include_empty_items=true"
+    )
+    resp = safe_get(url)
+    data = resp.json()
+    df = pd.DataFrame(data)
+    # Convertir timestamps a datetime
+    df["time_period_start"] = pd.to_datetime(df["time_period_start"])
+    df["time_period_end"]   = pd.to_datetime(df["time_period_end"])
+    # Asegurar columnas time_open y time_close (algunos días pueden no incluirlas)
+    if "time_open" in df.columns:
+        df["time_open"] = pd.to_datetime(df["time_open"])
+    else:
+        df["time_open"] = df["time_period_start"]
+    if "time_close" in df.columns:
+        df["time_close"] = pd.to_datetime(df["time_close"])
+    else:
+        df["time_close"] = df["time_period_end"]
+    # Índice temporal
+    return df.set_index("time_period_start").sort_index()
+
+
+def ingest_ohlcv(symbol: str, time_start: str, time_end: str, conn, cur, period_id: str = "5MIN"):
+    """
+    Inserta datos OHLCV en la tabla coinapi_ohlcv usando el period_id especificado.
+    """
+    # Extraer la fecha del periodo para logging
+    date = time_start.split("T")[0] if "T" in time_start else time_start
+    df = fetch_ohlcv_5min(symbol, time_start, time_end, period_id)
+    # Filtrar periodos sin operaciones (trades_count == 0)
+    total_bars = len(df)
+    df = df[df['trades_count'] > 0]
+    skipped = total_bars - len(df)
+    if skipped > 0:
+        print(f"[OHLCV] Saltados {skipped} periodos vacíos para {symbol} en {date}")
+    rows = []
+    for ts, row in df.iterrows():
+        rows.append(
+            (
+                symbol,
+                ts.isoformat(),
+                row["time_period_end"].isoformat(),
+                row["time_open"].isoformat(),
+                row["time_close"].isoformat(),
+                float(row["price_open"]),
+                float(row["price_high"]),
+                float(row["price_low"]),
+                float(row["price_close"]),
+                float(row["volume_traded"]),
+                int(row["trades_count"])
+            )
+        )
+    sql = """
+        INSERT OR REPLACE INTO coinapi_ohlcv
+        (symbol, time_period_start, time_period_end,
+         time_open, time_close,
+         price_open, price_high, price_low, price_close,
+         volume_traded, trades_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    cur.executemany(sql, rows)
+    conn.commit()
+    print(f"[OHLCV] Insertados {len(rows)} registros de OHLCV ({period_id}) para {symbol} en {date}")
+
+def ingest_ohlcv_for_date(symbol: str, date_str: str, conn, cur, period_id: str = "5MIN"):
+    """
+    Ingesta OHLCV para un único día (00:00 UTC a 24:00 UTC).
+    """
+    start = f"{date_str}T00:00:00"
+    end_dt = datetime.fromisoformat(date_str) + timedelta(days=1)
+    end = end_dt.isoformat()
+    ingest_ohlcv(symbol, start, end, conn, cur, period_id)
+
 
 def fetch_orderbook_5min(symbol: str, date: str) -> pd.DataFrame:
     """
@@ -183,6 +286,7 @@ def fetch_orderbook_5min(symbol: str, date: str) -> pd.DataFrame:
     )
     return df
 
+
 def ingest_orderbook(symbol: str, date: str, conn, cur):
     """
     Inserta datos de orderbook 5-min (hasta 3 niveles) en la tabla coinapi_orderbook.
@@ -215,21 +319,18 @@ def ingest_orderbook(symbol: str, date: str, conn, cur):
 
     if rows:
         cur.executemany(sql, rows)
-    # Commit siempre para asegurar persistencia incluso sin datos
     conn.commit()
     print(f"[Orderbook] Prepared {len(rows)} rows for {symbol} on {date}")
 
+
 def process_symbol(symbol_row):
     symbol, start_str, end_str = symbol_row
-    # Abrir conexión SQLite propia para este hilo
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur  = conn.cursor()
-    # PRAGMAs para rendimiento
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
     cur.execute("PRAGMA cache_size=10000;")
 
-    # Última fecha procesada
     cur.execute("SELECT last_date FROM ingestion_progress WHERE symbol_id = ?", (symbol,))
     row = cur.fetchone()
     if row and row[0]:
@@ -237,12 +338,10 @@ def process_symbol(symbol_row):
     else:
         last_date = datetime.fromisoformat(start_str).date() - timedelta(days=1)
 
-    # Extiende el rango hasta ayer como mínimo para evitar bloqueos si data_end está atrasado
     stored_end   = datetime.fromisoformat(end_str).date()
     today_minus1 = datetime.now(timezone.utc).date() - timedelta(days=1)
     end_date     = max(stored_end, today_minus1)
 
-    # Fechas pendientes
     pending_dates = []
     curr = last_date + timedelta(days=1)
     while curr <= end_date:
@@ -254,41 +353,42 @@ def process_symbol(symbol_row):
             pending_dates.append(curr.isoformat())
         curr += timedelta(days=1)
 
-    # Procesar en batch con captura de errores
     for date_str in pending_dates:
         try:
             ingest_orderbook(symbol, date_str, conn, cur)
-            # Actualizar progreso siempre, incluso si no se insertaron filas
             cur.execute(
                 "INSERT OR REPLACE INTO ingestion_progress(symbol_id, last_date) VALUES (?, ?)",
                 (symbol, date_str)
             )
-            # Commit tras cada fecha (datos + progreso)
             conn.commit()
         except Exception as e:
-            # Log sin abortar el hilo
             print(f"[Orderbook] Error en {symbol} {date_str}: {e}")
             continue
 
-    # conn.commit()  # Removed commit at the end of process_symbol
     conn.close()
     print(f"[Orderbook] Completed {len(pending_dates)} days for {symbol}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Ingestión de datos CoinAPI")
     parser.add_argument('--symbol-info', action='store_true', help='Actualizar metadata de símbolos')
     parser.add_argument('--orderbook',   action='store_true', help='Ingestar orderbook histórico por día')
-    parser.add_argument('--funding', action='store_true',
-                        help='Ingestar histórico de funding rate de MEXC')
-    parser.add_argument('--symbol', '-s', type=str, help='Ingestar orderbook para un símbolo específico; por defecto ingesta todos.')
+    parser.add_argument('--funding', action='store_true', help='Ingestar histórico de funding rate de MEXC')
+    parser.add_argument('--symbol', '-s', nargs='+', type=str, help='Ingestar datos solo para los símbolos especificados; por defecto ingesta todos.')
+    parser.add_argument('--ohlcv', action='store_true', help='Ingestar OHLCV histórico por rango de fechas')
+    parser.add_argument('--period-id', '-p', type=str, default='5MIN', help='Period ID para OHLCV, p.ej. 5MIN, 1HRS, etc.')
     args = parser.parse_args()
 
     conn = sqlite3.connect(DB_FILE)
     cur  = conn.cursor()
 
     if args.symbol_info:
-        cur.execute("SELECT symbol_id FROM symbol_info;")
-        symbols = [r[0] for r in cur.fetchall()]
+        # Ingestar metadata solo para símbolos especificados o todos si no se indica
+        if args.symbol:
+            symbols = args.symbol
+        else:
+            cur.execute("SELECT symbol_id FROM symbol_info;")
+            symbols = [r[0] for r in cur.fetchall()]
         for sym in symbols:
             try:
                 ingest_symbol_info(sym, conn, cur)
@@ -297,32 +397,84 @@ def main():
 
     if args.orderbook:
         if args.symbol:
-            cur.execute(
-                "SELECT symbol_id, data_start, data_end FROM symbol_info WHERE symbol_id = ?;",
-                (args.symbol,)
-            )
-            symbol_rows = cur.fetchall()
+            # Construir lista de rows para cada símbolo dado
+            symbol_rows = []
+            for sym in args.symbol:
+                cur.execute(
+                    "SELECT symbol_id, data_start, data_end FROM symbol_info WHERE symbol_id = ?;",
+                    (sym,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    print(f"[Error] Símbolo {sym} no encontrado en symbol_info.")
+                else:
+                    symbol_rows.append(row)
             if not symbol_rows:
-                print(f"[Error] Símbolo {args.symbol} no encontrado en symbol_info.")
                 return
         else:
             cur.execute("SELECT symbol_id, data_start, data_end FROM symbol_info;")
             symbol_rows = cur.fetchall()
-        conn.close()  # Cada hilo abre su propia conexión
+        conn.close()
         with ThreadPoolExecutor(max_workers=4) as executor:
             executor.map(process_symbol, symbol_rows)
         return
 
-    if args.funding:
+    if args.ohlcv:
+        # Lista de símbolos a procesar
         if args.symbol:
-            symbols = [args.symbol]  # Solo el símbolo indicado por CLI
+            symbols = args.symbol
         else:
-            # Todos los contratos perpetuos registrados en symbol_info
+            cur.execute("SELECT symbol_id FROM symbol_info;")
+            symbols = [r[0] for r in cur.fetchall()]
+
+        for sym in symbols:
+            # Obtener rango disponible desde symbol_info
+            cur.execute(
+                "SELECT data_start, data_end FROM symbol_info WHERE symbol_id = ?;",
+                (sym,)
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                print(f"[OHLCV] No hay metadata de fechas para {sym}. Ejecute --symbol-info primero.")
+                continue
+            # Rango: desde data_start hasta hoy (fecha de ejecución)
+            data_start, _ = row
+            start_date = datetime.fromisoformat(data_start).date()
+            # Utilizar la fecha de hoy UTC como fecha final
+            end_date = datetime.now(timezone.utc).date()
+
+            # Detectar fechas faltantes
+            pending_dates = []
+            curr = start_date
+            while curr <= end_date:
+                cur.execute(
+                    "SELECT 1 FROM coinapi_ohlcv WHERE symbol = ? AND date(time_period_start) = ?;",
+                    (sym, curr.isoformat())
+                )
+                if not cur.fetchone():
+                    pending_dates.append(curr.isoformat())
+                curr += timedelta(days=1)
+
+            # Ingestar solo días faltantes
+            for date_str in pending_dates:
+                try:
+                    ingest_ohlcv_for_date(sym, date_str, conn, cur, args.period_id)
+                except Exception as e:
+                    print(f"[OHLCV] Error en {sym} para {date_str}: {e}")
+                    continue
+
+        conn.close()
+        return
+
+    if args.funding:
+        # Ingestar funding rates para símbolos especificados o todos los perp si no se indica
+        if args.symbol:
+            symbols = args.symbol
+        else:
             cur.execute(
                 "SELECT symbol_id FROM symbol_info WHERE symbol_id LIKE 'MEXCFTS_PERP_%';"
             )
             symbols = [r[0] for r in cur.fetchall()]
-
         for sym in symbols:
             try:
                 ingest_mexc_funding(sym, conn, cur)
