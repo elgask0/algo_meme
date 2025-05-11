@@ -6,6 +6,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/ingest_coinapi.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": ["--symbol-info"]
     },
@@ -14,28 +15,30 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/ingest_coinapi.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "args": ["--orderbook", "--symbol", "MEXC_SPOT_GIGA_USDT"]
+      "args": ["--orderbook"]
     },
     {
       "name": "Python: Ingest Funding",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/ingest_coinapi.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": ["--funding"]
     },
     {
-      "name": "Python: Ingest OHLCV Auto",
+      "name": "Python: Ingest OHLCV",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/ingest_coinapi.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": [
         "--ohlcv",
-        "--symbol",
-        "MEXC_SPOT_SPX_USDT",
-        "--period-id", "5MIN"
+        "--period-id",
+        "5MIN"
       ]
     },
     {
@@ -43,6 +46,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/clean_tables.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": [
         "--symbol",
@@ -50,7 +54,6 @@
         "MEXC_SPOT_SPX_USDT",
         "MEXCFTS_PERP_GIGA_USDT",
         "MEXCFTS_PERP_SPX_USDT"
-
       ]
     },
     {
@@ -58,6 +61,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/clean_tables.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": [
         "--symbol",
@@ -72,16 +76,16 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/compute_mark_price_vwap.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "args": [
-        "--symbol",
-      ]
+      "args": ["--symbol"]
     },
     {
       "name": "Python: Compute Perp Synthetic",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/compute_perp_synthetic.py",
+      "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": []
     }

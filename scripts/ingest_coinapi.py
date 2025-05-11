@@ -1,3 +1,58 @@
+def process_ohlcv_for_date_task(symbol, date_str, period_id):
+    """
+    Wrapper que abre su propia conexión a SQLite y llama a ingest_ohlcv_for_date.
+    """
+    logs = []
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cur  = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+    # Evitar llamada a API si ya existen datos para este día (comparando fecha ISO)
+    cur.execute(
+        "SELECT 1 FROM coinapi_ohlcv WHERE symbol = ? AND substr(time_period_start, 1, 10) = ?;",
+        (symbol, date_str)
+    )
+    if cur.fetchone():
+        logs.append(f"[OHLCV] Ya existen datos para {symbol} en {date_str}, omitiendo API.")
+        conn.close()
+        return logs
+    try:
+        logs = ingest_ohlcv_for_date(symbol, date_str, conn, cur, period_id)
+    except Exception as e:
+        logs = [f"[OHLCV] Error en {symbol} para {date_str}: {e}"]
+    conn.close()
+    return logs
+
+# --- Wrappers para symbol_info y funding ---
+def process_symbol_info_task(symbol):
+    """
+    Wrapper que abre conexión propia y llama a ingest_symbol_info.
+    """
+    logs = []
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cur = conn.cursor()
+    try:
+        logs = ingest_symbol_info(symbol, conn, cur)
+    except Exception as e:
+        logs = [f"[CoinAPI] Error metadata {symbol}: {e}"]
+    conn.close()
+    return logs
+
+def process_funding_task(symbol):
+    """
+    Wrapper que abre conexión propia y llama a ingest_mexc_funding.
+    """
+    logs = []
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+    try:
+        logs = ingest_mexc_funding(symbol, conn, cur)
+    except Exception as e:
+        logs = [f"[MEXC] Error en funding para {symbol}: {e}"]
+    conn.close()
+    return logs
 import os
 import time
 import pandas as pd
@@ -9,6 +64,21 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
 from concurrent.futures import ThreadPoolExecutor
+
+# --- Helper para ejecución paralela y logs ordenados ---
+def run_parallel(func, args_list, max_workers=4):
+    """
+    Ejecuta func(args) en paralelo, recopila listas de logs y las imprime en orden.
+    """
+    print(f"[{func.__name__}] Lanzando {len(args_list)} tareas en paralelo (max_workers={max_workers})")
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for logs in executor.map(lambda arg: func(*arg), args_list):
+            results.append(logs)
+    # Imprimir los bloques de logs en orden
+    for logs in results:
+        for line in logs:
+            print(line)
 
 # --- Utilidades específicas para símbolos MEXC --------------------------------
 MEXC_PERP_PREFIX = "MEXCFTS_PERP_"
@@ -48,6 +118,7 @@ def ingest_mexc_funding(symbol: str, conn, cur):
     """
     Inserta el histórico de funding rates de MEXC en la tabla mexc_funding_rate_history.
     """
+    logs = []
     api_sym = mexc_api_symbol(symbol)
     # Obtener el último timestamp almacenado para este símbolo
     cur.execute(
@@ -60,6 +131,16 @@ def ingest_mexc_funding(symbol: str, conn, cur):
         last_ms = int(last_dt.timestamp() * 1000)
     else:
         last_ms = None
+
+    # Evitar llamada a MEXC API si no hay datos nuevos
+    if last_ms is not None:
+        last_dt = pd.to_datetime(last_row[0])
+        last_date = last_dt.date()
+        if last_date >= datetime.now(timezone.utc).date() - timedelta(days=1):
+            logs.append(
+                f"[MEXC] Funding ya actualizado para {symbol} hasta {last_date.isoformat()}, omitiendo API."
+            )
+            return logs
 
     all_records = fetch_mexc_funding_rate_history(api_sym)
     # Filtrar solo los funding rates posteriores al último registrado
@@ -79,7 +160,8 @@ def ingest_mexc_funding(symbol: str, conn, cur):
     if rows:
         cur.executemany(sql, rows)
         conn.commit()
-    print(f"[MEXC] Insertados {len(rows)} registros de funding para {symbol}")
+    logs.append(f"[MEXC] Insertados {len(rows)} registros de funding para {symbol}")
+    return logs
 
 # Carga variables de entorno (.env)
 load_dotenv()
@@ -140,10 +222,21 @@ def ingest_symbol_info(symbol: str, conn, cur):
     """
     Actualiza metadatos de un símbolo en la tabla symbol_info de SQLite.
     """
+    logs = []
+    # Evitar llamada a CoinAPI si ya hay metadata
+    cur.execute(
+        "SELECT data_end FROM symbol_info WHERE symbol_id = ?",
+        (symbol,)
+    )
+    meta = cur.fetchone()
+    if meta and meta[0]:
+        logs.append(f"[CoinAPI] Metadata ya actualizada para {symbol} (data_end={meta[0]}), omitiendo API.")
+        return logs
+
     info = fetch_symbol_info(symbol)
     if not info or 'symbol_id' not in info:
-        print(f"[CoinAPI] No se encontraron metadatos para {symbol}.")
-        return
+        logs.append(f"[CoinAPI] No se encontraron metadatos para {symbol}.")
+        return logs
 
     cur.execute(
         """
@@ -167,7 +260,8 @@ def ingest_symbol_info(symbol: str, conn, cur):
         )
     )
     conn.commit()
-    print(f"[CoinAPI] Metadata actualizada para {symbol}")
+    logs.append(f"[CoinAPI] Metadata actualizada para {symbol}")
+    return logs
 
 
 def fetch_ohlcv_5min(symbol: str, time_start: str, time_end: str, period_id: str = "5MIN") -> pd.DataFrame:
@@ -202,6 +296,7 @@ def fetch_ohlcv_5min(symbol: str, time_start: str, time_end: str, period_id: str
 def ingest_ohlcv(symbol: str, time_start: str, time_end: str, conn, cur, period_id: str = "5MIN"):
     """
     Inserta datos OHLCV en la tabla coinapi_ohlcv usando el period_id especificado.
+    Retorna el número de filas insertadas.
     """
     # Extraer la fecha del periodo para logging
     date = time_start.split("T")[0] if "T" in time_start else time_start
@@ -210,8 +305,7 @@ def ingest_ohlcv(symbol: str, time_start: str, time_end: str, conn, cur, period_
     total_bars = len(df)
     df = df[df['trades_count'] > 0]
     skipped = total_bars - len(df)
-    if skipped > 0:
-        print(f"[OHLCV] Saltados {skipped} periodos vacíos para {symbol} en {date}")
+    # (No imprimir aquí)
     rows = []
     for ts, row in df.iterrows():
         rows.append(
@@ -239,16 +333,44 @@ def ingest_ohlcv(symbol: str, time_start: str, time_end: str, conn, cur, period_
     """
     cur.executemany(sql, rows)
     conn.commit()
-    print(f"[OHLCV] Insertados {len(rows)} registros de OHLCV ({period_id}) para {symbol} en {date}")
+    return len(rows)
 
 def ingest_ohlcv_for_date(symbol: str, date_str: str, conn, cur, period_id: str = "5MIN"):
     """
     Ingesta OHLCV para un único día (00:00 UTC a 24:00 UTC).
+    Devuelve lista de logs.
     """
+    logs = []
     start = f"{date_str}T00:00:00"
     end_dt = datetime.fromisoformat(date_str) + timedelta(days=1)
     end = end_dt.isoformat()
-    ingest_ohlcv(symbol, start, end, conn, cur, period_id)
+    # Llamar a ingest_ohlcv y obtener cantidad de filas
+    rows_inserted = ingest_ohlcv(symbol, start, end, conn, cur, period_id)
+    # Si no hay datos, insertar un marcador para evitar reintentos futuros
+    if rows_inserted == 0:
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO coinapi_ohlcv
+            (symbol, time_period_start, time_period_end,
+             time_open, time_close,
+             price_open, price_high, price_low, price_close,
+             volume_traded, trades_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol,
+                start,
+                end,
+                start,
+                end,
+                0, 0, 0, 0, 0, 0
+            )
+        )
+        conn.commit()
+        logs.append(f"[OHLCV] Sin datos para {symbol} en {date_str}, insertado marcador.")
+    else:
+        logs.append(f"[OHLCV] Insertados {rows_inserted} registros de OHLCV ({period_id}) para {symbol} en {date_str}")
+    return logs
 
 
 def fetch_orderbook_5min(symbol: str, date: str) -> pd.DataFrame:
@@ -290,7 +412,9 @@ def fetch_orderbook_5min(symbol: str, date: str) -> pd.DataFrame:
 def ingest_orderbook(symbol: str, date: str, conn, cur):
     """
     Inserta datos de orderbook 5-min (hasta 3 niveles) en la tabla coinapi_orderbook.
+    Devuelve lista de logs.
     """
+    logs = []
     df = fetch_orderbook_5min(symbol, date)
 
     placeholders = ", ".join(["?"] * 15)
@@ -319,54 +443,52 @@ def ingest_orderbook(symbol: str, date: str, conn, cur):
 
     if rows:
         cur.executemany(sql, rows)
+    else:
+        # Insertar marcador para días sin snapshots y evitar reintentos
+        placeholder = (
+            symbol,
+            f"{date}T00:00:00",
+            date,
+            # 12 campos de None para bid/ask px y size
+            None, None, None, None, None, None, None, None, None, None, None, None
+        )
+        cur.execute(sql, placeholder)
     conn.commit()
-    print(f"[Orderbook] Prepared {len(rows)} rows for {symbol} on {date}")
+
+    if rows:
+        logs.append(f"[Orderbook] Prepared {len(rows)} rows for {symbol} on {date}")
+    else:
+        logs.append(f"[Orderbook] Sin snapshots para {symbol} en {date}, insertado marcador.")
+    return logs
 
 
-def process_symbol(symbol_row):
-    symbol, start_str, end_str = symbol_row
+# --- Wrapper para procesamiento de orderbook por fecha ---
+def process_orderbook_for_date_task(symbol, date_str):
+    """
+    Wrapper que abre su propia conexión y procesa orderbook para una fecha concreta.
+    """
+    logs = []
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur  = conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
-    cur.execute("PRAGMA cache_size=10000;")
-
-    cur.execute("SELECT last_date FROM ingestion_progress WHERE symbol_id = ?", (symbol,))
-    row = cur.fetchone()
-    if row and row[0]:
-        last_date = datetime.fromisoformat(row[0]).date()
-    else:
-        last_date = datetime.fromisoformat(start_str).date() - timedelta(days=1)
-
-    stored_end   = datetime.fromisoformat(end_str).date()
-    today_minus1 = datetime.now(timezone.utc).date() - timedelta(days=1)
-    end_date     = max(stored_end, today_minus1)
-
-    pending_dates = []
-    curr = last_date + timedelta(days=1)
-    while curr <= end_date:
-        cur.execute(
-            "SELECT 1 FROM coinapi_orderbook WHERE symbol_id = ? AND date = ?",
-            (symbol, curr.isoformat())
-        )
-        if not cur.fetchone():
-            pending_dates.append(curr.isoformat())
-        curr += timedelta(days=1)
-
-    for date_str in pending_dates:
-        try:
-            ingest_orderbook(symbol, date_str, conn, cur)
-            cur.execute(
-                "INSERT OR REPLACE INTO ingestion_progress(symbol_id, last_date) VALUES (?, ?)",
-                (symbol, date_str)
-            )
-            conn.commit()
-        except Exception as e:
-            print(f"[Orderbook] Error en {symbol} {date_str}: {e}")
-            continue
-
+    # Omite si ya existe marcador o datos para este día
+    cur.execute(
+        "SELECT 1 FROM coinapi_orderbook WHERE symbol_id = ? AND date = ?;",
+        (symbol, date_str)
+    )
+    if cur.fetchone():
+        logs.append(f"[Orderbook] Ya existen datos para {symbol} en {date_str}, omitiendo API.")
+        conn.close()
+        return logs
+    try:
+        logs = ingest_orderbook(symbol, date_str, conn, cur)
+    except Exception as e:
+        logs = [f"[Orderbook] Error en {symbol} para {date_str}: {e}"]
     conn.close()
-    print(f"[Orderbook] Completed {len(pending_dates)} days for {symbol}")
+    return logs
+
+
 
 
 def main():
@@ -383,40 +505,50 @@ def main():
     cur  = conn.cursor()
 
     if args.symbol_info:
-        # Ingestar metadata solo para símbolos especificados o todos si no se indica
+        # Obtener lista de símbolos
         if args.symbol:
             symbols = args.symbol
         else:
             cur.execute("SELECT symbol_id FROM symbol_info;")
             symbols = [r[0] for r in cur.fetchall()]
-        for sym in symbols:
-            try:
-                ingest_symbol_info(sym, conn, cur)
-            except Exception as e:
-                print(f"[CoinAPI] Error metadata {sym}: {e}")
+        conn.close()
+        # Ejecutar en paralelo con wrappers
+        tasks = [(sym,) for sym in symbols]
+        run_parallel(process_symbol_info_task, tasks)
+        return
 
     if args.orderbook:
+        # Obtener símbolos y fechas pendientes
         if args.symbol:
-            # Construir lista de rows para cada símbolo dado
-            symbol_rows = []
-            for sym in args.symbol:
-                cur.execute(
-                    "SELECT symbol_id, data_start, data_end FROM symbol_info WHERE symbol_id = ?;",
-                    (sym,)
-                )
-                row = cur.fetchone()
-                if not row:
-                    print(f"[Error] Símbolo {sym} no encontrado en symbol_info.")
-                else:
-                    symbol_rows.append(row)
-            if not symbol_rows:
-                return
+            symbols = args.symbol
         else:
-            cur.execute("SELECT symbol_id, data_start, data_end FROM symbol_info;")
-            symbol_rows = cur.fetchall()
+            cur.execute("SELECT symbol_id, data_start FROM symbol_info;")
+            symbols = cur.fetchall()  # [(symbol, data_start), ...]
+
+        tasks = []
+        today = datetime.now(timezone.utc).date()
+        for symbol, start_str in symbols:
+            start_date = datetime.fromisoformat(start_str).date()
+            curr = start_date
+            while curr <= today:
+                date_iso = curr.isoformat()
+                cur.execute(
+                    "SELECT 1 FROM coinapi_orderbook WHERE symbol_id = ? AND date = ?;",
+                    (symbol, date_iso)
+                )
+                if not cur.fetchone():
+                    tasks.append((symbol, date_iso))
+                curr += timedelta(days=1)
+
+        # Si no hay tareas pendientes, omitir
+        if not tasks:
+            print("[Orderbook] No hay fechas pendientes para ningún símbolo, omitiendo descarga.")
+            conn.close()
+            return
+
         conn.close()
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            executor.map(process_symbol, symbol_rows)
+        # Ejecutar en paralelo tareas por fecha
+        run_parallel(process_orderbook_for_date_task, tasks, max_workers=8)
         return
 
     if args.ohlcv:
@@ -427,24 +559,20 @@ def main():
             cur.execute("SELECT symbol_id FROM symbol_info;")
             symbols = [r[0] for r in cur.fetchall()]
 
+        # Detectar tareas pendientes: (símbolo, fecha, period_id)
+        tasks = []
         for sym in symbols:
-            # Obtener rango disponible desde symbol_info
             cur.execute(
                 "SELECT data_start, data_end FROM symbol_info WHERE symbol_id = ?;",
                 (sym,)
             )
             row = cur.fetchone()
             if not row or not row[0]:
-                print(f"[OHLCV] No hay metadata de fechas para {sym}. Ejecute --symbol-info primero.")
+                # No metadata
+                tasks.append((sym, None, args.period_id))
                 continue
-            # Rango: desde data_start hasta hoy (fecha de ejecución)
-            data_start, _ = row
-            start_date = datetime.fromisoformat(data_start).date()
-            # Utilizar la fecha de hoy UTC como fecha final
-            end_date = datetime.now(timezone.utc).date()
-
-            # Detectar fechas faltantes
-            pending_dates = []
+            start_date = datetime.fromisoformat(row[0]).date()
+            end_date   = datetime.now(timezone.utc).date()
             curr = start_date
             while curr <= end_date:
                 cur.execute(
@@ -452,22 +580,22 @@ def main():
                     (sym, curr.isoformat())
                 )
                 if not cur.fetchone():
-                    pending_dates.append(curr.isoformat())
+                    tasks.append((sym, curr.isoformat(), args.period_id))
                 curr += timedelta(days=1)
 
-            # Ingestar solo días faltantes
-            for date_str in pending_dates:
-                try:
-                    ingest_ohlcv_for_date(sym, date_str, conn, cur, args.period_id)
-                except Exception as e:
-                    print(f"[OHLCV] Error en {sym} para {date_str}: {e}")
-                    continue
+        # Si no hay tareas pendientes, salir sin llamar a la API
+        if not tasks:
+            print("[OHLCV] No hay fechas pendientes para ningún símbolo, omitiendo descarga.")
+            conn.close()
+            return
 
         conn.close()
+        # Ejecutar en paralelo con conexiones propias
+        run_parallel(process_ohlcv_for_date_task, tasks)
         return
 
     if args.funding:
-        # Ingestar funding rates para símbolos especificados o todos los perp si no se indica
+        # Obtener lista de símbolos perp
         if args.symbol:
             symbols = args.symbol
         else:
@@ -475,13 +603,10 @@ def main():
                 "SELECT symbol_id FROM symbol_info WHERE symbol_id LIKE 'MEXCFTS_PERP_%';"
             )
             symbols = [r[0] for r in cur.fetchall()]
-        for sym in symbols:
-            try:
-                ingest_mexc_funding(sym, conn, cur)
-            except Exception as e:
-                print(f"[MEXC] Error en funding para {sym}: {e}")
-                continue
         conn.close()
+        # Ejecutar en paralelo con wrappers
+        tasks = [(sym,) for sym in symbols]
+        run_parallel(process_funding_task, tasks)
         return
 
     conn.close()

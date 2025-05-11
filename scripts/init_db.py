@@ -102,20 +102,6 @@ def main():
       ON coinapi_orderbook_clean(symbol_id, date);
     """)
 
-    # 4) Tabla para seguimiento de ingestión diaria de orderbook
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ingestion_progress (
-      symbol_id TEXT PRIMARY KEY,
-      last_date TEXT
-    );
-    """)
-
-    # Índice para acelerar búsquedas por símbolo y fecha
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_date
-      ON coinapi_orderbook(symbol_id, date);
-    """)
-
     # 5) Tabla de funding rate histórico de MEXC
     cur.execute("""
     CREATE TABLE IF NOT EXISTS mexc_funding_rate_history (
@@ -139,10 +125,6 @@ def main():
       PRIMARY KEY(symbol_id, ts_start)
     );
     """)
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_vwap_symbol_date
-      ON mark_price_vwap(symbol_id, ts_start);
-    """)
 
     # 7) Tabla de perp_synthetic (synthetic perpetual)
     cur.execute("""
@@ -154,18 +136,6 @@ def main():
       funding_cum      REAL,
       spot_price       REAL,
       PRIMARY KEY(symbol_id, ts_start)
-    );
-    """)
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_perp_symbol_date
-      ON perp_synthetic(symbol_id, ts_start);
-    """)
-
-    # 8) Tabla de seguimiento de progreso para perp_synthetic
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS perp_sync_progress (
-      symbol_id TEXT PRIMARY KEY,
-      last_ts   TEXT
     );
     """)
 
