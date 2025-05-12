@@ -1,217 +1,272 @@
 #!/usr/bin/env python3
 import sqlite3
 import pandas as pd
-import pandera as pa
-from pandera import DataFrameSchema, Column, Check
 import numpy as np
 import os
 import argparse
 from dotenv import load_dotenv
+import logging
+from datetime import datetime # Importar datetime para isinstance
 
-"""
-Script: compute_mark_price_vwap.py
-Ubicación: scripts/compute_mark_price_vwap.py
+# --- Configuración de Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s [%(funcName)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-Este script:
- 1. Carga snapshots limpios de coinapi_orderbook_clean
- 2. Valida esquema con Pandera
- 3. Calcula VWAP a 3 niveles y suma de profundidad
- 4. Agrega en buckets de 5 minutos (mediana, recuento)
- 5. Inserta (append) en mark_price_vwap
-"""
-
+# --- Carga de Variables de Entorno y Constantes ---
 load_dotenv()
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in locals() else os.getcwd()
 DEFAULT_DB_FILE = os.path.join(BASE_DIR, "trading_data.db")
 DEFAULT_FREQ = "5min"
+DEFAULT_CROSS_CHECK_THRESHOLD = 0.02
 
-# Esquema de validación de snapshots limpios
-ORDERBOOK_CLEAN_SCHEMA = DataFrameSchema({
-    "symbol_id": Column(str, nullable=False),
-    "ts": Column(pa.DateTime, nullable=False),
-    "date": Column(pa.DateTime, nullable=False),
-    "bid1_px": Column(float, Check.ge(0), nullable=False),
-    "bid1_sz": Column(float, Check.gt(0), nullable=False),
-    "bid2_px": Column(float, Check.ge(0), nullable=False),
-    "bid2_sz": Column(float, Check.gt(0), nullable=False),
-    "bid3_px": Column(float, Check.ge(0), nullable=False),
-    "bid3_sz": Column(float, Check.gt(0), nullable=False),
-    "ask1_px": Column(float, Check.ge(0), nullable=False),
-    "ask1_sz": Column(float, Check.gt(0), nullable=False),
-    "ask2_px": Column(float, Check.ge(0), nullable=False),
-    "ask2_sz": Column(float, Check.gt(0), nullable=False),
-    "ask3_px": Column(float, Check.ge(0), nullable=False),
-    "ask3_sz": Column(float, Check.gt(0), nullable=False),
-    "flag_ob_bad_structure": Column(int, Check.isin([0,1]), nullable=False),
-    "flag_spread_mad": Column(int, Check.isin([0,1]), nullable=False),
-    "flag_mid_mad": Column(int, Check.isin([0,1]), nullable=False),
-})
+def setup_output_tables(conn):
+    """Crea las tablas de salida. Elimina las existentes para asegurar el esquema correcto."""
+    with conn:
+        logger.info("Eliminando tablas 'mark_price_vwap' y 'mark_price_anomalies' si existen para recrearlas...")
+        conn.execute("DROP TABLE IF EXISTS mark_price_vwap;")
+        conn.execute("DROP TABLE IF EXISTS mark_price_anomalies;")
+        
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS mark_price_vwap (
+            symbol_id TEXT NOT NULL,
+            ts_start TEXT NOT NULL,
+            ts_end TEXT NOT NULL,
+            mark_price REAL,
+            depth_sum_sz REAL, 
+            n_snapshots INTEGER,
+            PRIMARY KEY (symbol_id, ts_start)
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS mark_price_anomalies (
+            symbol_id TEXT,
+            ts_start TEXT,
+            mark_price REAL,
+            ohlcv_price_close REAL,
+            relative_difference REAL
+        );
+        """)
+        logger.info("Tablas 'mark_price_vwap' y 'mark_price_anomalies' creadas/recreadas.")
 
-def load_orderbook_clean(db_path: str, symbol: str, date: str = None) -> pd.DataFrame:
-    """Carga snapshots limpios, opcionalmente filtrando por fecha."""
+def load_orderbook_clean(db_path: str, symbol: str, date_filter: str = None) -> pd.DataFrame:
+    logger.info(f"Cargando datos de orderbook limpio para {symbol}" + (f" en fecha {date_filter}" if date_filter else ""))
     conn = sqlite3.connect(db_path)
-    query = "SELECT * FROM coinapi_orderbook_clean WHERE symbol_id = ?"
+    query = "SELECT ts, date, bid1_px, bid1_sz, bid2_px, bid2_sz, bid3_px, bid3_sz, ask1_px, ask1_sz, ask2_px, ask2_sz, ask3_px, ask3_sz FROM coinapi_orderbook_clean WHERE symbol_id = ?"
     params = [symbol]
-    if date:
-        query += " AND date = ?"
-        params.append(date)
-    df = pd.read_sql(query, conn, params=params, parse_dates=["ts", "date"])
-    print(f"[DEBUG] load_orderbook_clean: params={params}, filas tras SQL={len(df)}")
-    conn.close()
+    if date_filter:
+        query += " AND date = ?" 
+        params.append(date_filter)
+    
+    try:
+        df = pd.read_sql_query(query, conn, params=params)
+        df["ts"] = pd.to_datetime(df["ts"], errors='coerce')
+        df["date"] = pd.to_datetime(df["date"], errors='coerce') 
+        df = df.dropna(subset=['ts']) 
+        logger.info(f"Snapshots cargados y 'ts' convertido para {symbol}: {len(df)}")
+    except Exception as e:
+        logger.error(f"Error cargando datos de orderbook para {symbol}: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
     return df
 
-def validate_orderbook(df: pd.DataFrame) -> pd.DataFrame:
-    """Valida el DataFrame con Pandera."""
-    ORDERBOOK_CLEAN_SCHEMA.validate(df, lazy=False)
-    return df
+def calculate_vwap_and_depth(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    df_calc = df.copy()
+    bid_sz_cols = ["bid1_sz", "bid2_sz", "bid3_sz"]; ask_sz_cols = ["ask1_sz", "ask2_sz", "ask3_sz"]
+    bid_px_cols = ["bid1_px", "bid2_px", "bid3_px"]; ask_px_cols = ["ask1_px", "ask2_px", "ask3_px"]
+    for col_group in [bid_sz_cols, ask_sz_cols, bid_px_cols, ask_px_cols]:
+        for col in col_group:
+            if col not in df_calc.columns: df_calc[col] = 0.0
+            df_calc[col] = pd.to_numeric(df_calc[col], errors='coerce').fillna(0)
+    total_bid_value = sum(df_calc[px] * df_calc[sz] for px, sz in zip(bid_px_cols, bid_sz_cols))
+    total_ask_value = sum(df_calc[px] * df_calc[sz] for px, sz in zip(ask_px_cols, ask_sz_cols))
+    total_bid_size = sum(df_calc[sz] for sz in bid_sz_cols)
+    total_ask_size = sum(df_calc[sz] for sz in ask_sz_cols)
+    df_calc["total_value"] = total_bid_value + total_ask_value
+    df_calc["total_size"] = total_bid_size + total_ask_size
+    df_calc["vwap"] = np.where(df_calc["total_size"] > 1e-9, df_calc["total_value"] / df_calc["total_size"], np.nan)
+    df_calc["depth_sum_sz"] = df_calc["total_size"] 
+    return df_calc[["ts", "vwap", "depth_sum_sz"]]
 
-def compute_vwap(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula VWAP y profundidad para cada snapshot."""
-    df = df.copy()
-    df["vwap"] = (
-        df["bid1_px"] * df["bid1_sz"] +
-        df["bid2_px"] * df["bid2_sz"] +
-        df["bid3_px"] * df["bid3_sz"] +
-        df["ask1_px"] * df["ask1_sz"] +
-        df["ask2_px"] * df["ask2_sz"] +
-        df["ask3_px"] * df["ask3_sz"]
-    ) / (
-        df["bid1_sz"] + df["bid2_sz"] + df["bid3_sz"] +
-        df["ask1_sz"] + df["ask2_sz"] + df["ask3_sz"]
-    )
-    df["depth_sum_sz"] = (
-        df["bid1_sz"] + df["bid2_sz"] + df["bid3_sz"] +
-        df["ask1_sz"] + df["ask2_sz"] + df["ask3_sz"]
-    )
-    return df
-
-def aggregate_mark_price(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Agrega VWAP en buckets de frecuencia dada (p.ej. '5min')."""
-    df = df.set_index("ts")
-    print(f"[DEBUG] aggregate_mark_price: filas antes de agrupar = {df.shape}")
-    df["ts_start"] = df.index.floor(freq)
-    df["ts_end"]   = df["ts_start"] + pd.Timedelta(freq)
-    agg = (
-        df.groupby(["symbol_id", "ts_start"], as_index=False)
+def aggregate_vwap(df: pd.DataFrame, symbol_id: str, freq: str) -> pd.DataFrame:
+    if df.empty or 'vwap' not in df.columns: return pd.DataFrame()
+    df_agg = df.set_index("ts")
+    if not isinstance(df_agg.index, pd.DatetimeIndex): return pd.DataFrame()
+    df_agg["ts_start"] = df_agg.index.floor(freq)
+    df_agg["ts_end"]   = df_agg["ts_start"] + pd.Timedelta(freq)
+    aggregated = (
+        df_agg.groupby("ts_start")
           .agg(
-              mark_price   = ("vwap",         "median"),
-              depth_sum_sz = ("depth_sum_sz", "median"),
-              n_snapshots  = ("vwap",         "count"),
-              ts_end       = ("ts_end",       "first")
+              mark_price     = ("vwap", "median"), 
+              depth_sum_sz   = ("depth_sum_sz", "median"),
+              n_snapshots    = ("vwap", "count"), 
+              ts_end         = ("ts_end", "first") 
           )
-    )
-    # Formatear a ISO UTC
-    agg["ts_start"] = agg["ts_start"].dt.tz_localize("UTC").astype(str)
-    agg["ts_end"]   = agg["ts_end"].dt.tz_localize("UTC").astype(str)
-    return agg
+    ).reset_index()
+    aggregated["symbol_id"] = symbol_id
+    cols = ["symbol_id", "ts_start", "ts_end", "mark_price", "depth_sum_sz", "n_snapshots"]
+    aggregated = aggregated[cols]
+    logger.info(f"Agregados {len(aggregated)} buckets de mark price para {symbol_id}.")
+    return aggregated
 
-
-def cross_check_with_ohlcv(conn, df_mark, symbol, threshold=0.005):
-    """
-    Cross-check mark price against OHLCV close:
-    - Loads price_close from coinapi_ohlcv_clean over the same ts_start range.
-    - Computes relative difference and flags anomalies.
-    """
-    # Load OHLCV close prices
-    q = """
-    SELECT time_period_start AS ts_start, price_close
-    FROM coinapi_ohlcv_clean
-    WHERE symbol = ?
-      AND time_period_start BETWEEN ? AND ?
-    """
-    ohlcv = pd.read_sql(q, conn, params=[
-        symbol,
-        df_mark.ts_start.min(),
-        df_mark.ts_start.max()
-    ], parse_dates=["ts_start"])
-    # Alinear tipos de ts_start: convertir ambos a datetime sin zona
-    df_mark = df_mark.copy()
-    df_mark["ts_start"] = pd.to_datetime(df_mark["ts_start"], utc=True).dt.tz_localize(None)
-    ohlcv["ts_start"]   = ohlcv["ts_start"].dt.tz_localize(None)
-    # Merge y cálculo
-    df = df_mark.merge(ohlcv, on="ts_start", how="left")
-    df["rel_diff"] = (df["mark_price"] - df["price_close"]).abs() / df["price_close"]
-    df["flag_rel_diff"] = df["rel_diff"] > threshold
-    return df
-
-def persist_mark_price(df: pd.DataFrame, db_path: str):
-    """Inserta o actualiza los resultados en SQLite."""
-    # Keep only the table's columns
-    df_to_write = df[["symbol_id","ts_start","ts_end","mark_price","depth_sum_sz","n_snapshots"]].copy()
-    # Ensure datetime columns are strings for SQLite binding
-    df_to_write["ts_start"] = df_to_write["ts_start"].astype(str)
-    df_to_write["ts_end"]   = df_to_write["ts_end"].astype(str)
+def cross_check_mark_price(df_mark: pd.DataFrame, db_path: str, symbol: str, threshold: float) -> pd.DataFrame:
+    if df_mark.empty:
+        return df_mark.assign(ohlcv_price_close=np.nan, relative_difference=np.nan, flag_anomaly=False)
     conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    records = df_to_write.to_dict(orient='records')
-    cursor.executemany(
-        "INSERT OR IGNORE INTO mark_price_vwap (symbol_id, ts_start, ts_end, mark_price, depth_sum_sz, n_snapshots) VALUES (?, ?, ?, ?, ?, ?)",
-        [(r['symbol_id'], r['ts_start'], r['ts_end'], r['mark_price'], r['depth_sum_sz'], r['n_snapshots']) for r in records]
+    min_ts_start_dt = pd.to_datetime(df_mark["ts_start"].min())
+    max_ts_start_dt = pd.to_datetime(df_mark["ts_start"].max())
+    min_ts_start_str = min_ts_start_dt.strftime('%Y-%m-%dT%H:%M:%S.%f') if pd.notna(min_ts_start_dt) else None
+    max_ts_start_str = max_ts_start_dt.strftime('%Y-%m-%dT%H:%M:%S.%f') if pd.notna(max_ts_start_dt) else None
+
+    if not min_ts_start_str or not max_ts_start_str:
+        logger.warning(f"Rango de ts_start inválido para cross-check de {symbol}.")
+        return df_mark.assign(ohlcv_price_close=np.nan, relative_difference=np.nan, flag_anomaly=False)
+        
+    query_ohlcv = "SELECT time_period_start, price_close FROM coinapi_ohlcv_clean WHERE symbol = ? AND time_period_start BETWEEN ? AND ?"
+    try:
+        df_ohlcv = pd.read_sql_query(query_ohlcv, conn, params=[symbol, min_ts_start_str, max_ts_start_str])
+        df_ohlcv["time_period_start"] = pd.to_datetime(df_ohlcv["time_period_start"])
+    except Exception as e:
+        logger.error(f"Error cargando OHLCV para cross-check de {symbol}: {e}")
+        return df_mark.assign(ohlcv_price_close=np.nan, relative_difference=np.nan, flag_anomaly=False)
+    finally: conn.close()
+    if df_ohlcv.empty:
+        logger.warning(f"No se encontraron datos OHLCV para cross-check para {symbol}.")
+        return df_mark.assign(ohlcv_price_close=np.nan, relative_difference=np.nan, flag_anomaly=False)
+    
+    df_mark_copy = df_mark.copy()
+    df_mark_copy["ts_start"] = pd.to_datetime(df_mark_copy["ts_start"])
+    df_merged = pd.merge(df_mark_copy, df_ohlcv, left_on="ts_start", right_on="time_period_start", how="left")
+    df_merged["relative_difference"] = np.where(
+        df_merged["price_close"].notna() & (df_merged["price_close"].abs() > 1e-9), 
+        (df_merged["mark_price"] - df_merged["price_close"]).abs() / df_merged["price_close"],
+        np.nan
     )
-    conn.commit()
-    conn.close()
+    df_merged["flag_anomaly"] = df_merged["relative_difference"] > threshold
+    logger.info(f"Cross-check para {symbol}: {df_merged['flag_anomaly'].sum()} anomalías encontradas (umbral {threshold*100:.1f}%).")
+    return df_merged.rename(columns={"price_close": "ohlcv_price_close"})
+
+def format_value_for_sqlite(value):
+    """Prepara un valor individual para la inserción en SQLite."""
+    if pd.isna(value): # Cubre pd.NaT, np.nan, None
+        return None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.strftime('%Y-%m-%dT%H:%M:%S.%f')
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    return str(value) # Como último recurso, convertir a string
+
+def persist_results(df_to_persist: pd.DataFrame, table_name: str, db_path: str):
+    if df_to_persist.empty:
+        logger.info(f"No hay datos para persistir en la tabla {table_name}.")
+        return
+
+    # No es necesario hacer df_copy aquí si solo vamos a iterar para crear tuplas
+    
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = df_to_persist.columns.tolist()
+        placeholders = ','.join('?' * len(columns))
+        
+        sql_action = "INSERT OR REPLACE" if table_name == "mark_price_vwap" else "INSERT"
+        sql = f"{sql_action} INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
+        
+        # Convertir cada fila del DataFrame a una tupla de valores formateados para SQLite
+        list_of_tuples = []
+        for record_tuple_raw in df_to_persist.itertuples(index=False): 
+            processed_record = [format_value_for_sqlite(value) for value in record_tuple_raw]
+            list_of_tuples.append(tuple(processed_record))
+        
+        if not list_of_tuples: 
+            logger.warning(f"No hay tuplas válidas para insertar en {table_name} después de la preparación."); return
+        
+        with conn: 
+            conn.executemany(sql, list_of_tuples)
+        logger.info(f"{len(df_to_persist)} filas procesadas para la tabla {table_name}.") # Loguear len(df_to_persist)
+    except Exception as e:
+        logger.error(f"Error al persistir datos en {table_name}: {e}", exc_info=True)
+        if 'list_of_tuples' in locals() and list_of_tuples:
+            logger.error(f"Primeros registros que se intentaron insertar en {table_name}:\n{list_of_tuples[:2]}")
+    finally:
+        conn.close()
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Compute VWAP-based mark price (3 levels, 5min)"
-    )
-    parser.add_argument(
-        "--symbol", "-s",
-        nargs="*",
-        help="Símbolos a procesar (p.ej. BTC_USDT); si no se indica, procesa todos los symbols en coinapi_orderbook_clean",
-    )
-    parser.add_argument(
-        "--db-file", "-d",
-        default=DEFAULT_DB_FILE,
-        help="Ruta a la DB SQLite"
-    )
-    parser.add_argument(
-        "--freq", "-f",
-        default=DEFAULT_FREQ,
-        help="Frecuencia de bucket (ej. '5min')"
-    )
-    parser.add_argument(
-        "--date",
-        help="Fecha YYYY-MM-DD para filtrar snapshots"
-    )
+    parser = argparse.ArgumentParser(description="Calcula Mark Price (VWAP) desde datos de orderbook limpio y lo valida contra OHLCV.")
+    parser.add_argument("--symbol", "-s", nargs="*", help="Símbolo(s) a procesar. Si no se especifica, procesa todos.")
+    parser.add_argument("--db-file", "-d", default=DEFAULT_DB_FILE, help="Ruta al archivo de base de datos SQLite.")
+    parser.add_argument("--freq", "-f", default=DEFAULT_FREQ, help="Frecuencia de agregación para el mark price (ej. '5min').")
+    parser.add_argument("--date-filter", help="Fecha específica (YYYY-MM-DD) para filtrar los snapshots del orderbook.")
+    parser.add_argument("--cross-check-threshold", type=float, default=DEFAULT_CROSS_CHECK_THRESHOLD, help="Umbral de diferencia relativa para marcar anomalías en validación cruzada.")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Nivel de logging.")
     args = parser.parse_args()
 
-    # Determinar símbolos a procesar; si no se pasa ninguno, tomar todos de la tabla clean
-    if not args.symbol:
-        conn_all = sqlite3.connect(args.db_file)
-        cur_all = conn_all.cursor()
-        cur_all.execute("SELECT DISTINCT symbol_id FROM coinapi_orderbook_clean;")
-        symbols = [r[0] for r in cur_all.fetchall()]
-        conn_all.close()
-    else:
-        symbols = args.symbol
+    logger.setLevel(args.log_level.upper())
 
-    for symbol in symbols:
-        print(f"Computando mark price VWAP para {symbol} (freq={args.freq})")
-        df_ob = load_orderbook_clean(args.db_file, symbol, args.date)
-        print(f"[DEBUG] snapshots cargados para {symbol}: {len(df_ob)}")
+    db_path = args.db_file
+    if not os.path.exists(db_path):
+        logger.critical(f"Archivo de base de datos no encontrado: {db_path}"); return
+
+    conn_setup = sqlite3.connect(db_path)
+    setup_output_tables(conn_setup) 
+    conn_setup.close()
+
+    symbols_to_process = args.symbol
+    if not symbols_to_process:
+        conn_sym = sqlite3.connect(db_path)
+        try:
+            symbols_to_process = pd.read_sql_query("SELECT DISTINCT symbol_id FROM coinapi_orderbook_clean;", conn_sym)["symbol_id"].tolist()
+            if not symbols_to_process:
+                logger.warning("No se encontraron símbolos en 'coinapi_orderbook_clean'. No hay nada que procesar.")
+                return
+            logger.info(f"Procesando todos los símbolos encontrados: {symbols_to_process}")
+        except Exception as e:
+            logger.error(f"No se pudo obtener la lista de símbolos: {e}"); return
+        finally:
+            conn_sym.close()
+            
+    processed_symbols_count = 0
+    for symbol in symbols_to_process:
+        logger.info(f"--- Procesando Mark Price para Símbolo: {symbol} (Freq: {args.freq}) ---")
+        
+        df_ob = load_orderbook_clean(db_path, symbol, args.date_filter)
         if df_ob.empty:
-            print(f"No hay snapshots para {symbol}. Continuando.")
+            logger.warning(f"No hay snapshots de orderbook limpio para {symbol}" + (f" en {args.date_filter}" if args.date_filter else "") + ". Saltando.")
             continue
-        df_ob = validate_orderbook(df_ob)
-        df_v  = compute_vwap(df_ob)
-        df_agg = aggregate_mark_price(df_v, args.freq)
-        if df_agg.empty:
-            print(f"No hay buckets para insertar para {symbol}. Continuando.")
+
+        df_vwap_snapshots = calculate_vwap_and_depth(df_ob)
+        if df_vwap_snapshots.empty or 'vwap' not in df_vwap_snapshots.columns or df_vwap_snapshots['vwap'].isnull().all():
+            logger.warning(f"No se pudo calcular VWAP para {symbol}. Saltando.")
             continue
-        # Cross-check against OHLCV close and record anomalies
-        with sqlite3.connect(args.db_file) as conn_x:
-            df_agg = cross_check_with_ohlcv(conn_x, df_agg, symbol)
-            anomalies = df_agg[df_agg.flag_rel_diff]
-            print(f"[DEBUG] buckets totales antes de filtrar anomalías para {symbol}: {len(df_agg)}")
-            print(f"[DEBUG] anomalías encontradas para {symbol}: {len(anomalies)}")
-            if not anomalies.empty:
-                anomalies.to_sql("mark_price_anomalies", conn_x,
-                                 if_exists="append", index=False)
-            df_agg = df_agg[~df_agg.flag_rel_diff]
-        # Persist cleaned buckets
-        persist_mark_price(df_agg, args.db_file)
-        print(f"Insertados {len(df_agg)} buckets en mark_price_vwap para {symbol} (sin anomalías).")
+            
+        df_mark_price_agg = aggregate_vwap(df_vwap_snapshots, symbol, args.freq)
+        if df_mark_price_agg.empty:
+            logger.warning(f"No se generaron buckets de mark price agregado para {symbol}. Saltando.")
+            continue
+
+        df_checked = cross_check_mark_price(df_mark_price_agg, db_path, symbol, args.cross_check_threshold)
+        
+        anomalies = df_checked[df_checked["flag_anomaly"] == True].copy() 
+        valid_mark_prices = df_checked[df_checked["flag_anomaly"] == False].copy()
+
+        if not anomalies.empty:
+            cols_anomalies = ["symbol_id", "ts_start", "mark_price", "ohlcv_price_close", "relative_difference"]
+            anomalies_to_persist = anomalies[cols_anomalies] 
+            persist_results(anomalies_to_persist, "mark_price_anomalies", db_path)
+        
+        if not valid_mark_prices.empty:
+            cols_mark_price = ["symbol_id", "ts_start", "ts_end", "mark_price", "depth_sum_sz", "n_snapshots"] 
+            valid_to_persist = valid_mark_prices[cols_mark_price] 
+            persist_results(valid_to_persist, "mark_price_vwap", db_path)
+        else:
+            logger.info(f"No hay mark prices válidos para persistir para {symbol} después del cross-check.")
+        
+        processed_symbols_count +=1
+        logger.info(f"--- Mark Price para Símbolo: {symbol} completado ---")
+
+    logger.info(f"Proceso de cálculo de Mark Price completado. {processed_symbols_count} símbolos procesados.")
 
 if __name__ == "__main__":
     main()

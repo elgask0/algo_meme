@@ -63,13 +63,7 @@
       "program": "${workspaceFolder}/scripts/clean_tables.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "args": [
-        "--symbol",
-        "MEXC_SPOT_GIGA_USDT",
-        "MEXC_SPOT_SPX_USDT",
-        "MEXCFTS_PERP_GIGA_USDT",
-        "MEXCFTS_PERP_SPX_USDT"
-      ]
+      "args": []
     },
     {
       "name": "Python: Compute Mark Price VWAP",
