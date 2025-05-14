@@ -57,13 +57,16 @@
       ]
     },
     {
-      "name": "Python: Clean All Symbols",
+      "name": "Python: Clean All Symbols with Filters", // Nombre actualizado
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/clean_tables.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "args": []
+      "args": [
+        "--min-start-date", "2024-01-01", // Ejemplo: filtrar datos anteriores al 1 de enero de 2024
+        "--min-initial-price", "0.01"     // Ejemplo: filtrar datos hasta que el precio alcance 0.01
+      ]
     },
     {
       "name": "Python: Compute Mark Price VWAP",
