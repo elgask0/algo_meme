@@ -11,11 +11,15 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 # --- Configuración General ---
-DATA_FILEPATH = "/Users/elgask0/REPOS/algo_meme/trading_data.db"
-LOG_DIR = "/Users/elgask0/REPOS/algo_meme/logs"
-PLOT_DIR = "/Users/elgask0/REPOS/algo_meme/plots"
+# Define BASE_DIR as the parent directory of the scripts directory (i.e., the project root)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+TRADING_DAYS_PER_YEAR = 252
+
+# DATA_FILEPATH and FUNDING_FILEPATH are removed, will be handled by StrategyParameters
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+PLOT_DIR = os.path.join(BASE_DIR, "plots")
 LOG_FILE = os.path.join(LOG_DIR, "backtest_run.log")
-FUNDING_FILEPATH = "/Users/elgask0/REPOS/algo_meme/data/funding_rate_history.csv"
 TRADES_CSV_FILE = os.path.join(LOG_DIR, "trades_summary.csv")
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -32,6 +36,7 @@ logging.basicConfig(
 # Dataclass to collect all tunable strategy inputs in one place
 @dataclass
 class StrategyParameters:
+    DATA_FILEPATH: str = "data/spread_data.csv"  # Default CSV data file path
     ASSET_Y_COL: str = "MEXCFTS_PERP_SPX_USDT"
     ASSET_X_COL: str = "MEXCFTS_PERP_GIGA_USDT"
     OLS_WINDOW_DAYS: int = 30
@@ -57,33 +62,6 @@ class StrategyParameters:
     TRAIL_STOP_PCT: float = 1
 
 
-# Expose default strategy parameters as module-level globals for IDE/linting
-_default_params = StrategyParameters()
-ASSET_Y_COL = _default_params.ASSET_Y_COL
-ASSET_X_COL = _default_params.ASSET_X_COL
-OLS_WINDOW_DAYS = _default_params.OLS_WINDOW_DAYS
-ZSCORE_WINDOW_DAYS = _default_params.ZSCORE_WINDOW_DAYS
-BETA_P_VALUE_THRESHOLD = _default_params.BETA_P_VALUE_THRESHOLD
-MIN_OLS_R_SQUARED_THRESHOLD = _default_params.MIN_OLS_R_SQUARED_THRESHOLD
-ENTRY_ZSCORE = _default_params.ENTRY_ZSCORE
-EXIT_ZSCORE = _default_params.EXIT_ZSCORE
-STOP_LOSS_ZSCORE = _default_params.STOP_LOSS_ZSCORE
-POSITION_SIZE_PCT = _default_params.POSITION_SIZE_PCT
-MIN_NOMINAL_PER_LEG = _default_params.MIN_NOMINAL_PER_LEG
-TAKER_FEE_PCT = _default_params.TAKER_FEE_PCT
-SLIPPAGE_PCT = _default_params.SLIPPAGE_PCT
-SL_COOLDOWN_HOURS = _default_params.SL_COOLDOWN_HOURS
-PNL_STOP_LOSS_PCT = _default_params.PNL_STOP_LOSS_PCT
-INITIAL_CAPITAL = _default_params.INITIAL_CAPITAL
-RISK_FREE_RATE_ANNUAL = _default_params.RISK_FREE_RATE_ANNUAL
-RESAMPLE_ALL_DATA_TO_MINUTES = _default_params.RESAMPLE_ALL_DATA_TO_MINUTES
-DEFAULT_DATA_FREQ_MINUTES = _default_params.DEFAULT_DATA_FREQ_MINUTES
-BETA_MIN_THRESHOLD = _default_params.BETA_MIN_THRESHOLD
-BETA_MAX_THRESHOLD = _default_params.BETA_MAX_THRESHOLD
-BETA_ROLL_STD_MAX = _default_params.BETA_ROLL_STD_MAX
-TRAIL_STOP_PCT = _default_params.TRAIL_STOP_PCT
-
-
 # --- OOP Wrapper for Backtesting ---
 class PairTradingBacktester:
     def __init__(self, params: StrategyParameters = None):
@@ -92,80 +70,794 @@ class PairTradingBacktester:
         else:
             self.params = params
 
-    def run(self, df_input):
-        # Pass all params as keyword arguments to run_backtest
-        # Use asdict to extract all fields from the dataclass
-        param_dict = asdict(self.params)
-        return run_backtest(df_input, **param_dict)
+    def run(self, df_input: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+        return self._execute_backtest_strategy(df_input)
 
+    def _execute_backtest_strategy(self, df_input: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+        logging.info("Iniciando backtest...")
+        # --- Log strategy parameters for traceability ---
+        try:
+            logging.info(f"Estrategia parámetros: {asdict(self.params)}")
+        except Exception as e:
+            logging.warning(f"No se pudieron registrar los parámetros de estrategia: {e}")
+        df = df_input.copy()
 
-def load_data(filepath, params: StrategyParameters):
-    logging.info(f"Cargando datos desde BDD: {filepath}")
+        current_data_freq_minutes = self.params.DEFAULT_DATA_FREQ_MINUTES
+        if self.params.RESAMPLE_ALL_DATA_TO_MINUTES is not None and self.params.RESAMPLE_ALL_DATA_TO_MINUTES > 0:
+            logging.info(
+                f"Resampleando todos los datos a velas de {self.params.RESAMPLE_ALL_DATA_TO_MINUTES} minutos."
+            )
+            df = df.resample(f"{self.params.RESAMPLE_ALL_DATA_TO_MINUTES}min").last()
+            df.dropna(subset=[self.params.ASSET_Y_COL, self.params.ASSET_X_COL], inplace=True)
+            if df.empty:
+                logging.error("No hay datos después del resampleo general.")
+                return df, None, None
+            current_data_freq_minutes = self.params.RESAMPLE_ALL_DATA_TO_MINUTES
+            logging.info(
+                f"Datos resampleados. Nuevo rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
+            )
+
+        if current_data_freq_minutes <= 0:
+            logging.error(f"Frecuencia de datos ({current_data_freq_minutes}) inválida.")
+            return df, None, None
+
+        periods_in_day = (24 * 60) / current_data_freq_minutes
+        ols_window_periods = int(self.params.OLS_WINDOW_DAYS * periods_in_day)
+        zscore_window_periods = int(self.params.ZSCORE_WINDOW_DAYS * periods_in_day)
+
+        logging.info(f"Frecuencia de datos para cálculos: {current_data_freq_minutes} min.")
+        logging.info(
+            f"Ventana OLS: {self.params.OLS_WINDOW_DAYS} días = {ols_window_periods} periodos."
+        )
+        logging.info(
+            f"Ventana Z-Score: {self.params.ZSCORE_WINDOW_DAYS} días = {zscore_window_periods} periodos."
+        )
+
+        df = calculate_rolling_ols_and_spread(
+            df, self.params.ASSET_Y_COL, self.params.ASSET_X_COL, ols_window_periods, self.params
+        )
+        df["z_score"] = calculate_zscore(df["spread"], zscore_window_periods)
+
+        df.dropna(
+            subset=["alpha", "beta", "beta_p_value", "ols_r_squared", "spread", "z_score"],
+            inplace=True,
+        )
+        if df.empty:
+            logging.error(
+                "No hay datos válidos después de calcular OLS (incl. p-value y R² de beta) y Z-score."
+            )
+            return df, None, None
+
+        equity = self.params.INITIAL_CAPITAL
+        equity_curve = pd.Series(index=df.index, dtype=float)
+        trades_log = []
+
+        current_position = None
+        position_entry_market_price_y = None
+        position_entry_market_price_x = None
+        position_entry_exec_price_y = None
+        position_entry_exec_price_x = None
+        position_qty_y = 0
+        position_qty_x = 0
+        position_entry_alpha = None
+        position_entry_beta = None
+        position_entry_time = None
+        position_entry_zscore_value = None
+        position_entry_spread_value = None
+        is_leg_x_long = None
+        position_equity_base_for_pnl_stop = None  # NUEVO: Equity base para P&L Stop
+        position_total_entry_fees = None  # NUEVO: Comisiones de entrada del trade actual
+        trail_peak_pnl = None  # máx. PnL neto observado para trailing‑stop
+
+        sl_cooldown_until = None
+        z_signal_active = False  # Flag to avoid repeated skip logs for the same signal
+
+        for timestamp, row in df.iterrows():
+            z_score_val = row["z_score"]
+            # --- Funding cash‑flow ------------------------------------------------
+            if current_position:
+                # Y‑leg
+                fr_y = row.get("funding_rate_y", 0.0)
+                if fr_y:
+                    dir_y = 1 if current_position == "long_spread" else -1
+                    notional_y = position_qty_y * row[self.params.ASSET_Y_COL]
+                    funding_y_amount = fr_y * notional_y * dir_y
+                    equity -= funding_y_amount
+                    logging.debug(
+                        f"{timestamp}: Funding Y leg: fr_y={fr_y:.6f}, notional_y={notional_y:.2f}, dir={dir_y}, amount={funding_y_amount:.2f}"
+                    )
+
+                # X‑leg
+                fr_x = row.get("funding_rate_x", 0.0)
+                if fr_x:
+                    dir_x = 1 if is_leg_x_long else -1
+                    notional_x = position_qty_x * row[self.params.ASSET_X_COL]
+                    funding_x_amount = fr_x * notional_x * dir_x
+                    equity -= funding_x_amount
+                    logging.debug(
+                        f"{timestamp}: Funding X leg: fr_x={fr_x:.6f}, notional_x={notional_x:.2f}, dir={dir_x}, amount={funding_x_amount:.2f}"
+                    )
+            # ---------------------------------------------------------------------
+
+            # --- Mark‑to‑Market valuation (realised + floating PnL) ---
+            portfolio_value = equity
+            if current_position:
+                price_y = row[self.params.ASSET_Y_COL]
+                price_x = row[self.params.ASSET_X_COL]
+
+                # Floating PnL for Y‑leg
+                if current_position == "long_spread":
+                    pnl_y_float = (price_y - position_entry_exec_price_y) * position_qty_y
+                else:  # short_spread
+                    pnl_y_float = (position_entry_exec_price_y - price_y) * position_qty_y
+
+                # Floating PnL for X‑leg
+                if is_leg_x_long:
+                    pnl_x_float = (price_x - position_entry_exec_price_x) * position_qty_x
+                else:
+                    pnl_x_float = (position_entry_exec_price_x - price_x) * position_qty_x
+
+                portfolio_value += pnl_y_float + pnl_x_float
+
+            # Record the marked‑to‑market portfolio value for drawdown stats
+            equity_curve[timestamp] = portfolio_value
+
+            if sl_cooldown_until and timestamp < sl_cooldown_until:
+                logging.debug(
+                    f"{timestamp}: Skipping iteration due to cooldown until {sl_cooldown_until}"
+                )
+                continue
+            elif sl_cooldown_until and timestamp >= sl_cooldown_until:
+                logging.debug(f"{timestamp}: Cooldown por SL finalizado.")
+                sl_cooldown_until = None
+
+            if (
+                pd.isna(z_score_val)
+                or pd.isna(row["beta"])
+                or pd.isna(row["alpha"])
+                or pd.isna(row["beta_p_value"])
+                or pd.isna(row["ols_r_squared"])
+            ):
+                continue
+
+            # --- GESTIÓN DE POSICIONES ABIERTAS ---
+            if current_position:
+                exit_signal = False
+                exit_reason = None
+
+                # --- INICIO: NUEVO Stop-Loss por P&L ---
+                if (
+                    self.params.PNL_STOP_LOSS_PCT > 0
+                    and position_equity_base_for_pnl_stop is not None
+                    and position_total_entry_fees is not None
+                ):
+                    current_market_price_y_float = row[self.params.ASSET_Y_COL]
+                    current_market_price_x_float = row[self.params.ASSET_X_COL]
+                    pnl_y_float = 0
+                    pnl_x_float = 0
+
+                    if pd.isna(current_market_price_y_float) or pd.isna(
+                        current_market_price_x_float
+                    ):
+                        logging.warning(
+                            f"{timestamp}: Precio de mercado NaN para P&L flotante. Y: {current_market_price_y_float}, X: {current_market_price_x_float}. Saltando P&L Stop check esta barra."
+                        )
+                    else:
+                        if current_position == "long_spread":
+                            pnl_y_float = (
+                                current_market_price_y_float - position_entry_exec_price_y
+                            ) * position_qty_y
+                        else:  # short_spread
+                            pnl_y_float = (
+                                position_entry_exec_price_y - current_market_price_y_float
+                            ) * position_qty_y
+
+                        if is_leg_x_long:
+                            pnl_x_float = (
+                                current_market_price_x_float - position_entry_exec_price_x
+                            ) * position_qty_x
+                        else:  # short_spread_x
+                            pnl_x_float = (
+                                position_entry_exec_price_x - current_market_price_x_float
+                            ) * position_qty_x
+
+                        floating_pnl_gross = pnl_y_float + pnl_x_float
+                        floating_pnl_net_after_entry_costs = (
+                            floating_pnl_gross - position_total_entry_fees
+                        )
+                        max_loss_for_trade = (
+                            position_equity_base_for_pnl_stop * self.params.PNL_STOP_LOSS_PCT
+                        )
+
+                        # Log floating PnL details for P&L Stop-Loss
+                        logging.debug(
+                            f"{timestamp}: Floating PnL gross: {floating_pnl_gross:.2f}, "
+                            f"net after entry fees: {floating_pnl_net_after_entry_costs:.2f}, "
+                            f"max_loss_allowed: {max_loss_for_trade:.2f}"
+                        )
+
+                        if floating_pnl_net_after_entry_costs < -max_loss_for_trade:
+                            exit_signal = True
+                            exit_reason = f"P&L Stop Loss ({floating_pnl_net_after_entry_costs:.2f} < -{max_loss_for_trade:.2f})"
+                            sl_cooldown_until = timestamp + timedelta(
+                                hours=self.params.SL_COOLDOWN_HOURS
+                            )
+                            logging.warning(
+                                f"{timestamp}: P&L Stop Loss activado para {current_position}. PnL Flotante Neto: {floating_pnl_net_after_entry_costs:.2f}. Cooldown hasta {sl_cooldown_until}"
+                            )
+
+                        # --- Trailing‑stop check ---
+                        if floating_pnl_net_after_entry_costs > 0:
+                            if (
+                                trail_peak_pnl is None
+                                or floating_pnl_net_after_entry_costs > trail_peak_pnl
+                            ):
+                                trail_peak_pnl = floating_pnl_net_after_entry_costs
+                            elif (
+                                trail_peak_pnl - floating_pnl_net_after_entry_costs
+                            ) > trail_peak_pnl * self.params.TRAIL_STOP_PCT:
+                                exit_signal = True
+                                exit_reason = (
+                                    f"Trailing Stop ({floating_pnl_net_after_entry_costs:.2f} < "
+                                    f"{trail_peak_pnl*(1-self.params.TRAIL_STOP_PCT):.2f})"
+                                )
+                                sl_cooldown_until = timestamp + timedelta(
+                                    hours=self.params.SL_COOLDOWN_HOURS
+                                )
+                                logging.warning(
+                                    f"{timestamp}: Trailing‑stop activado. Cooldown hasta {sl_cooldown_until}"
+                                )
+                        # -----------------------------------------------------------
+                # --- FIN: NUEVO Stop-Loss por P&L ---
+
+                if not exit_signal:  # Solo comprobar Z-Score si P&L Stop no se activó
+                    if (
+                        current_position == "long_spread" and z_score_val >= -self.params.EXIT_ZSCORE
+                    ) or (
+                        current_position == "short_spread" and z_score_val <= self.params.EXIT_ZSCORE
+                    ):
+                        exit_signal = True
+                        exit_reason = f"Z-Score Reversion ({z_score_val:.2f})"
+                    elif (
+                        current_position == "long_spread"
+                        and z_score_val <= -self.params.STOP_LOSS_ZSCORE
+                    ) or (
+                        current_position == "short_spread"
+                        and z_score_val >= self.params.STOP_LOSS_ZSCORE
+                    ):
+                        exit_signal = True
+                        exit_reason = f"Z-Score SL ({z_score_val:.2f})"  # Modificado
+                        sl_cooldown_until = timestamp + timedelta(hours=self.params.SL_COOLDOWN_HOURS)
+                        logging.warning(
+                            f"{timestamp}: Z-Score Stop Loss activado. Cooldown hasta {sl_cooldown_until}"
+                        )
+
+                if exit_signal:
+                    market_price_y_exit = row[self.params.ASSET_Y_COL]
+                    market_price_x_exit = row[self.params.ASSET_X_COL]
+                    spread_value_at_exit = row["spread"]
+
+                    if current_position == "long_spread":
+                        exec_price_y_exit = apply_slippage(
+                            market_price_y_exit, "sell", self.params.SLIPPAGE_PCT
+                        )
+                        pnl_y = (
+                            exec_price_y_exit - position_entry_exec_price_y
+                        ) * position_qty_y
+                    else:
+                        exec_price_y_exit = apply_slippage(
+                            market_price_y_exit, "buy", self.params.SLIPPAGE_PCT
+                        )
+                        pnl_y = (
+                            position_entry_exec_price_y - exec_price_y_exit
+                        ) * position_qty_y
+
+                    if is_leg_x_long:
+                        exec_price_x_exit = apply_slippage(
+                            market_price_x_exit, "sell", self.params.SLIPPAGE_PCT
+                        )
+                        pnl_x = (
+                            exec_price_x_exit - position_entry_exec_price_x
+                        ) * position_qty_x
+                    else:
+                        exec_price_x_exit = apply_slippage(
+                            market_price_x_exit, "buy", self.params.SLIPPAGE_PCT
+                        )
+                        pnl_x = (
+                            position_entry_exec_price_x - exec_price_x_exit
+                        ) * position_qty_x
+
+                    slippage_cost_y_exit = (
+                        abs(exec_price_y_exit - market_price_y_exit) * position_qty_y
+                    )
+                    slippage_cost_x_exit = (
+                        abs(exec_price_x_exit - market_price_x_exit) * position_qty_x
+                    )
+
+                    fee_cost_y_exit = abs(
+                        exec_price_y_exit * position_qty_y * self.params.TAKER_FEE_PCT
+                    )
+                    fee_cost_x_exit = abs(
+                        exec_price_x_exit * position_qty_x * self.params.TAKER_FEE_PCT
+                    )
+                    total_fees_exit = fee_cost_y_exit + fee_cost_x_exit
+
+                    pnl_trade_gross = pnl_y + pnl_x
+                    pnl_trade_net_this_exit_leg = pnl_trade_gross - total_fees_exit
+
+                    equity += pnl_trade_net_this_exit_leg
+                    equity_curve[timestamp] = equity
+
+                    final_trade_pnl_net_calculated = 0
+                    updated_in_log = False
+                    for i in range(len(trades_log) - 1, -1, -1):
+                        if (
+                            trades_log[i]["exit_time"] is None
+                            and trades_log[i]["position_type"] == current_position
+                        ):
+                            trades_log[i].update(
+                                {
+                                    "exit_time": timestamp,
+                                    "exit_zscore": z_score_val,
+                                    "reason_exit": exit_reason,
+                                    "market_price_y_exit": market_price_y_exit,
+                                    "exec_price_y_exit": exec_price_y_exit,
+                                    "pnl_y": pnl_y,
+                                    "market_price_x_exit": market_price_x_exit,
+                                    "exec_price_x_exit": exec_price_x_exit,
+                                    "pnl_x": pnl_x,
+                                    "slippage_cost_y_exit": slippage_cost_y_exit,
+                                    "slippage_cost_x_exit": slippage_cost_x_exit,
+                                    "fee_cost_y_exit": fee_cost_y_exit,
+                                    "fee_cost_x_exit": fee_cost_x_exit,
+                                    "spread_value_at_exit": spread_value_at_exit,
+                                    "total_pnl_gross": pnl_trade_gross,
+                                    "total_fees": trades_log[i]["entry_fees_total"]
+                                    + total_fees_exit,
+                                    "equity_after_trade": equity,
+                                }
+                            )
+                            trades_log[i]["final_trade_pnl_net"] = (
+                                trades_log[i]["total_pnl_gross"]
+                                - trades_log[i]["total_fees"]
+                            )
+                            final_trade_pnl_net_calculated = trades_log[i][
+                                "final_trade_pnl_net"
+                            ]
+                            updated_in_log = True
+                            break
+                    if not updated_in_log:
+                        logging.error(
+                            f"Error: No se encontró trade abierto {current_position} para actualizar en {timestamp}"
+                        )
+
+                    logging.info(
+                        f"TRADE CLOSED: {current_position} | Reason: {exit_reason} | PnL Net: {final_trade_pnl_net_calculated:.2f} | Equity: {equity:.2f} | "
+                        f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_exit:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_exit:.4f}) | "
+                        f"Fees Exit: {total_fees_exit:.2f}, Slip Exit Y: {slippage_cost_y_exit:.2f}, Slip Exit X: {slippage_cost_x_exit:.2f}"
+                    )
+                    # Log net PnL per leg after slippage and fees
+                    net_pnl_y = pnl_y - slippage_cost_y_exit - fee_cost_y_exit
+                    net_pnl_x = pnl_x - slippage_cost_x_exit - fee_cost_x_exit
+                    logging.info(
+                        f"{timestamp}: Net PnL per leg: Y={net_pnl_y:.2f}, X={net_pnl_x:.2f}"
+                    )
+
+                    current_position = None
+                    is_leg_x_long = None
+                    position_equity_base_for_pnl_stop = None  # Resetear
+                    position_total_entry_fees = None  # Resetear
+                    trail_peak_pnl = None
+
+                    if (
+                        "SL" in exit_reason or "Stop Loss" in exit_reason
+                    ):  # Modificado para cubrir ambos tipos de stop
+                        continue
+
+            # --- LÓGICA DE APERTURA DE POSICIÓN ---
+            if not current_position:
+                # Skip if still in cooldown
+                if sl_cooldown_until and timestamp < sl_cooldown_until:
+                    continue
+                # Check if Z-score triggers an entry signal
+                z_signal = (
+                    z_score_val < -self.params.ENTRY_ZSCORE and z_score_val > -self.params.STOP_LOSS_ZSCORE
+                ) or (z_score_val > self.params.ENTRY_ZSCORE and z_score_val < self.params.STOP_LOSS_ZSCORE)
+                if not z_signal:
+                    # Reset on no signal
+                    z_signal_active = False
+                    continue
+                # If this is the first bar of the signal, allow logging; otherwise skip
+                if z_signal_active:
+                    continue
+                z_signal_active = True
+                # From here, proceed to filter checks and potential trade entry
+                if (
+                    row["beta_p_value"] >= self.params.BETA_P_VALUE_THRESHOLD
+                    or row["ols_r_squared"] < self.params.MIN_OLS_R_SQUARED_THRESHOLD
+                ):
+                    logging.debug(
+                        f"{timestamp}: Skipping trade: beta_p_value={row['beta_p_value']:.4f} (threshold {self.params.BETA_P_VALUE_THRESHOLD}), ols_r_squared={row['ols_r_squared']:.4f} (threshold {self.params.MIN_OLS_R_SQUARED_THRESHOLD})"
+                    )
+                    continue
+
+                # Skip if beta quality filter fails (2.1)
+                if not row.get("beta_ok", False):
+                    logging.debug(
+                        f"{timestamp}: Skipping trade: beta_ok False (beta={row['beta']:.4f} thresholds [{self.params.BETA_MIN_THRESHOLD}, {self.params.BETA_MAX_THRESHOLD}], beta_roll_std_20={row['beta_roll_std_20']:.4f} threshold {self.params.BETA_ROLL_STD_MAX})"
+                    )
+                    continue
+
+                # NUEVO: Guardar equity base para P&L stop y tamaño del trade
+                current_equity_base_for_trade_and_pnl_stop = equity
+
+                trade_nominal_total = (
+                    current_equity_base_for_trade_and_pnl_stop * self.params.POSITION_SIZE_PCT
+                )
+                beta_at_trade = row["beta"]
+                beta_abs = abs(beta_at_trade)
+                if (1 + beta_abs) == 0:
+                    logging.warning(
+                        f"{timestamp}: beta_abs es tal que (1+beta_abs) es cero. Beta: {beta_at_trade}. Saltando trade."
+                    )
+                    continue
+                nominal_y_alloc = trade_nominal_total / (1 + beta_abs)
+                nominal_x_alloc = trade_nominal_total * beta_abs / (1 + beta_abs)
+                if (
+                    nominal_y_alloc < self.params.MIN_NOMINAL_PER_LEG
+                    or nominal_x_alloc < self.params.MIN_NOMINAL_PER_LEG
+                ):
+                    logging.debug(
+                        f"{timestamp}: Skipping trade: nominal allocations too small: y={nominal_y_alloc:.2f}, x={nominal_x_alloc:.2f}, threshold={self.params.MIN_NOMINAL_PER_LEG}"
+                    )
+                    continue
+
+                current_market_price_y_entry = row[self.params.ASSET_Y_COL]
+                current_market_price_x_entry = row[self.params.ASSET_X_COL]
+                current_spread_value_at_entry = row["spread"]
+
+                if (
+                    pd.isna(current_market_price_y_entry)
+                    or pd.isna(current_market_price_x_entry)
+                    or current_market_price_y_entry <= 0
+                    or current_market_price_x_entry <= 0
+                ):
+                    logging.warning(
+                        f"{timestamp}: Precio inválido para Y o X. Y: {current_market_price_y_entry}, X: {current_market_price_x_entry}. Saltando trade."
+                    )
+                    continue
+
+                entry_type = None
+                current_is_leg_x_long = None
+                if z_score_val < -self.params.ENTRY_ZSCORE and z_score_val > -self.params.STOP_LOSS_ZSCORE:
+                    entry_type = "long_spread"
+                    exec_price_y_open = apply_slippage(
+                        current_market_price_y_entry, "buy", self.params.SLIPPAGE_PCT
+                    )
+                    if beta_at_trade < 0:
+                        exec_price_x_open = apply_slippage(
+                            current_market_price_x_entry, "buy", self.params.SLIPPAGE_PCT
+                        )
+                        current_is_leg_x_long = True
+                    else:
+                        exec_price_x_open = apply_slippage(
+                            current_market_price_x_entry, "sell", self.params.SLIPPAGE_PCT
+                        )
+                        current_is_leg_x_long = False
+                elif z_score_val > self.params.ENTRY_ZSCORE and z_score_val < self.params.STOP_LOSS_ZSCORE:
+                    entry_type = "short_spread"
+                    exec_price_y_open = apply_slippage(
+                        current_market_price_y_entry, "sell", self.params.SLIPPAGE_PCT
+                    )
+                    if beta_at_trade < 0:
+                        exec_price_x_open = apply_slippage(
+                            current_market_price_x_entry, "sell", self.params.SLIPPAGE_PCT
+                        )
+                        current_is_leg_x_long = False
+                    else:
+                        exec_price_x_open = apply_slippage(
+                            current_market_price_x_entry, "buy", self.params.SLIPPAGE_PCT
+                        )
+                        current_is_leg_x_long = True
+
+                if entry_type:
+                    if exec_price_y_open <= 0 or exec_price_x_open <= 0:
+                        logging.warning(
+                            f"{timestamp}: Precio de ejecución inválido post-slippage. Y_exec: {exec_price_y_open}, X_exec: {exec_price_x_open}. Saltando trade."
+                        )
+                        continue
+
+                    current_qty_y = nominal_y_alloc / exec_price_y_open
+                    current_qty_x = nominal_x_alloc / exec_price_x_open
+
+                    slippage_cost_y_entry = (
+                        abs(exec_price_y_open - current_market_price_y_entry)
+                        * current_qty_y
+                    )
+                    slippage_cost_x_entry = (
+                        abs(exec_price_x_open - current_market_price_x_entry)
+                        * current_qty_x
+                    )
+
+                    fee_cost_y_entry = abs(
+                        exec_price_y_open * current_qty_y * self.params.TAKER_FEE_PCT
+                    )
+                    fee_cost_x_entry = abs(
+                        exec_price_x_open * current_qty_x * self.params.TAKER_FEE_PCT
+                    )
+                    total_fees_entry = fee_cost_y_entry + fee_cost_x_entry
+
+                    equity -= total_fees_entry  # Equity se actualiza DESPUÉS de haber guardado current_equity_base_for_trade_and_pnl_stop
+                    equity_curve[timestamp] = equity
+                    trail_peak_pnl = None  # reinicia trailing para el nuevo trade
+
+                    current_position = entry_type
+                    position_entry_market_price_y = current_market_price_y_entry
+                    position_entry_market_price_x = current_market_price_x_entry
+                    position_entry_exec_price_y = exec_price_y_open
+                    position_entry_exec_price_x = exec_price_x_open
+                    position_qty_y = current_qty_y
+                    position_qty_x = current_qty_x
+                    position_entry_alpha = row["alpha"]
+                    position_entry_beta = beta_at_trade
+                    position_entry_time = timestamp
+                    position_entry_zscore_value = z_score_val
+                    position_entry_spread_value = current_spread_value_at_entry
+                    is_leg_x_long = current_is_leg_x_long
+                    # NUEVO: Guardar variables de estado para P&L Stop
+                    position_equity_base_for_pnl_stop = (
+                        current_equity_base_for_trade_and_pnl_stop
+                    )
+                    position_total_entry_fees = total_fees_entry
+
+                    trades_log.append(
+                        {
+                            "entry_time": timestamp,
+                            "exit_time": None,
+                            "position_type": current_position,
+                            "entry_zscore": position_entry_zscore_value,
+                            "exit_zscore": None,
+                            "reason_entry": f"Z-Score Signal ({z_score_val:.2f})",
+                            "reason_exit": None,
+                            "asset_y": self.params.ASSET_Y_COL,
+                            "market_price_y_entry": position_entry_market_price_y,
+                            "exec_price_y_entry": position_entry_exec_price_y,
+                            "market_price_y_exit": None,
+                            "exec_price_y_exit": None,
+                            "qty_y": position_qty_y,
+                            "nominal_y_alloc": nominal_y_alloc,
+                            "pnl_y": None,
+                            "slippage_cost_y_entry": slippage_cost_y_entry,
+                            "fee_cost_y_entry": fee_cost_y_entry,
+                            "slippage_cost_y_exit": None,
+                            "fee_cost_y_exit": None,
+                            "asset_x": self.params.ASSET_X_COL,
+                            "market_price_x_entry": position_entry_market_price_x,
+                            "exec_price_x_entry": position_entry_exec_price_x,
+                            "market_price_x_exit": None,
+                            "exec_price_x_exit": None,
+                            "qty_x": position_qty_x,
+                            "nominal_x_alloc": nominal_x_alloc,
+                            "pnl_x": None,
+                            "slippage_cost_x_entry": slippage_cost_x_entry,
+                            "fee_cost_x_entry": fee_cost_x_entry,
+                            "slippage_cost_x_exit": None,
+                            "fee_cost_x_exit": None,
+                            "entry_alpha": position_entry_alpha,
+                            "entry_beta": position_entry_beta,
+                            "beta_p_value_at_entry": row["beta_p_value"],
+                            "ols_r_squared_at_entry": row["ols_r_squared"],
+                            "spread_value_at_entry": position_entry_spread_value,
+                            "spread_value_at_exit": None,
+                            "is_leg_x_long_at_entry": is_leg_x_long,
+                            "entry_fees_total": total_fees_entry,
+                            "pnl_net_after_entry_costs": -total_fees_entry,
+                            "total_fees": None,
+                            "total_pnl_gross": None,
+                            "final_trade_pnl_net": None,
+                            "equity_after_trade": None,
+                        }
+                    )
+                    logging.info(
+                        f"TRADE OPENED: {current_position} | Z: {z_score_val:.2f} | Beta: {beta_at_trade:.4f} "
+                        f"(pVal: {row['beta_p_value']:.4f}, R²: {row['ols_r_squared']:.4f}) | "
+                        f"Market Y: {current_market_price_y_entry:.4f}, Exec Y: {exec_price_y_open:.4f}, Qty Y: {current_qty_y:.4f}, Slip Y: {slippage_cost_y_entry:.2f}, Fee Y: {fee_cost_y_entry:.2f} | "
+                        f"Market X: {current_market_price_x_entry:.4f}, Exec X: {exec_price_x_open:.4f}, Qty X: {current_qty_x:.4f}, Slip X: {slippage_cost_x_entry:.2f}, Fee X: {fee_cost_x_entry:.2f} | "
+                        f"Nom Y: {nominal_y_alloc:.2f}, Nom X: {nominal_x_alloc:.2f} | Eq after fees: {equity:.2f}"
+                    )
+
+        if current_position:  # Si hay posición abierta al final del backtest
+            logging.info(
+                f"Cerrando posición abierta al final del backtest: {current_position}"
+            )
+            last_row = df.iloc[-1]
+            market_price_y_exit_final = last_row[self.params.ASSET_Y_COL]
+            market_price_x_exit_final = last_row[self.params.ASSET_X_COL]
+            spread_value_at_exit_final = last_row["spread"]
+
+            if current_position == "long_spread":
+                exec_price_y_close = apply_slippage(
+                    market_price_y_exit_final, "sell", self.params.SLIPPAGE_PCT
+                )
+                pnl_y = (exec_price_y_close - position_entry_exec_price_y) * position_qty_y
+            else:
+                exec_price_y_close = apply_slippage(
+                    market_price_y_exit_final, "buy", self.params.SLIPPAGE_PCT
+                )
+                pnl_y = (position_entry_exec_price_y - exec_price_y_close) * position_qty_y
+            if is_leg_x_long:
+                exec_price_x_close = apply_slippage(
+                    market_price_x_exit_final, "sell", self.params.SLIPPAGE_PCT
+                )
+                pnl_x = (exec_price_x_close - position_entry_exec_price_x) * position_qty_x
+            else:
+                exec_price_x_close = apply_slippage(
+                    market_price_x_exit_final, "buy", self.params.SLIPPAGE_PCT
+                )
+                pnl_x = (position_entry_exec_price_x - exec_price_x_close) * position_qty_x
+
+            slippage_cost_y_exit_final = (
+                abs(exec_price_y_close - market_price_y_exit_final) * position_qty_y
+            )
+            slippage_cost_x_exit_final = (
+                abs(exec_price_x_close - market_price_x_exit_final) * position_qty_x
+            )
+            fee_cost_y_exit_final = abs(exec_price_y_close * position_qty_y * self.params.TAKER_FEE_PCT)
+            fee_cost_x_exit_final = abs(exec_price_x_close * position_qty_x * self.params.TAKER_FEE_PCT)
+            total_fees_close_final = fee_cost_y_exit_final + fee_cost_x_exit_final
+
+            pnl_trade_gross = pnl_y + pnl_x
+            pnl_trade_net_exit_leg = pnl_trade_gross - total_fees_close_final
+            equity += pnl_trade_net_exit_leg
+            equity_curve[df.index[-1]] = equity
+
+            final_trade_pnl_net_calculated_eob = 0
+            updated_in_log = False
+            for i in range(len(trades_log) - 1, -1, -1):
+                if trades_log[i]["exit_time"] is None:
+                    trades_log[i].update(
+                        {
+                            "exit_time": df.index[-1],
+                            "exit_zscore": last_row["z_score"],
+                            "reason_exit": "End of Backtest",
+                            "market_price_y_exit": market_price_y_exit_final,
+                            "exec_price_y_exit": exec_price_y_close,
+                            "pnl_y": pnl_y,
+                            "market_price_x_exit": market_price_x_exit_final,
+                            "exec_price_x_exit": exec_price_x_close,
+                            "pnl_x": pnl_x,
+                            "slippage_cost_y_exit": slippage_cost_y_exit_final,
+                            "slippage_cost_x_exit": slippage_cost_x_exit_final,
+                            "fee_cost_y_exit": fee_cost_y_exit_final,
+                            "fee_cost_x_exit": fee_cost_x_exit_final,
+                            "spread_value_at_exit": spread_value_at_exit_final,
+                            "total_pnl_gross": pnl_trade_gross,
+                            "total_fees": trades_log[i]["entry_fees_total"]
+                            + total_fees_close_final,
+                            "equity_after_trade": equity,
+                        }
+                    )
+                    trades_log[i]["final_trade_pnl_net"] = (
+                        trades_log[i]["total_pnl_gross"] - trades_log[i]["total_fees"]
+                    )
+                    final_trade_pnl_net_calculated_eob = trades_log[i][
+                        "final_trade_pnl_net"
+                    ]
+                    updated_in_log = True
+                    break
+            if not updated_in_log:
+                logging.error(
+                    f"Error: No se encontró trade abierto {current_position} para actualizar al final."
+                )
+            logging.info(
+                f"TRADE CLOSED (End of Data): {current_position} | PnL Net: {final_trade_pnl_net_calculated_eob:.2f} | Equity: {equity:.2f} | "
+                f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_close:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_close:.4f})"
+            )
+
+        logging.info("Backtest finalizado.")
+        return df, equity_curve.dropna(), pd.DataFrame(trades_log)
+
+def load_data(filepath: str, params: StrategyParameters):
+    # logging.info(f"Cargando datos desde BDD: {filepath}")
+    # try:
+    #     conn = sqlite3.connect(filepath)
+    #     # --- Obtener precios de mark_price_vwap para ambos símbolos ---
+    #     query_mark = f"""
+    #         SELECT ts_start, symbol_id, mark_price
+    #         FROM mark_price_vwap
+    #         WHERE symbol_id IN ('{params.ASSET_Y_COL}', '{params.ASSET_X_COL}')
+    #     """
+    #     df_mark = pd.read_sql_query(query_mark, conn, parse_dates=['ts_start'])
+    #     if df_mark.empty:
+    #         logging.error("No hay datos de precios en mark_price_vwap para los activos.")
+    #         conn.close()
+    #         return None
+    #     # Pivotar para tener columnas separadas para cada símbolo
+    #     df_mark_pivot = df_mark.pivot(index='ts_start', columns='symbol_id', values='mark_price')
+    #     # Renombrar columnas para que coincidan con ASSET_Y_COL y ASSET_X_COL
+    #     df = df_mark_pivot.rename(columns={
+    #         params.ASSET_Y_COL: params.ASSET_Y_COL,
+    #         params.ASSET_X_COL: params.ASSET_X_COL
+    #     })
+
+    #     # --- Obtener funding rates históricos para ambos símbolos ---
+    #     query_funding = f"""
+    #         SELECT ts AS ts, symbol, funding_rate
+    #         FROM mexc_funding_rate_history
+    #         WHERE symbol IN ('{params.ASSET_Y_COL}', '{params.ASSET_X_COL}')
+    #     """
+    #     df_funding = pd.read_sql_query(query_funding, conn, parse_dates=['ts'])
+    #     conn.close()
+
+    #     df_funding_y = (
+    #         df_funding[df_funding['symbol'] == params.ASSET_Y_COL]
+    #         .set_index('ts')[['funding_rate']]
+    #         .rename(columns={'funding_rate': 'funding_rate_y'})
+    #     )
+    #     df_funding_x = (
+    #         df_funding[df_funding['symbol'] == params.ASSET_X_COL]
+    #         .set_index('ts')[['funding_rate']]
+    #         .rename(columns={'funding_rate': 'funding_rate_x'})
+    #     )
+
+    #     # Unir las funding rates y rellenar con 0 donde falten datos
+    #     df = (
+    #         df.join(df_funding_y, how="left")
+    #           .join(df_funding_x, how="left")
+    #           .fillna({"funding_rate_y": 0.0, "funding_rate_x": 0.0})
+    #     )
+    #     df.sort_index(inplace=True)
+
+    #     # Eliminar filas sin datos de precio
+    #     df.dropna(subset=[params.ASSET_Y_COL, params.ASSET_X_COL], inplace=True)
+    #     if df.empty:
+    #         logging.error("No hay datos después de eliminar NaNs iniciales.")
+    #         return None
+
+    #     logging.info(
+    #         f"Datos cargados. Rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
+    #     )
+    #     return df
+    # except sqlite3.Error as e:
+    #     logging.error(f"Error cargando datos desde BDD: {e}")
+    #     return None
+
+    logging.info(f"Cargando datos desde CSV: {filepath}")
     try:
-        conn = sqlite3.connect(filepath)
-        # --- Obtener precios de mark_price_vwap para ambos símbolos ---
-        query_mark = f"""
-            SELECT ts_start, symbol_id, mark_price
-            FROM mark_price_vwap
-            WHERE symbol_id IN ('{params.ASSET_Y_COL}', '{params.ASSET_X_COL}')
-        """
-        df_mark = pd.read_sql_query(query_mark, conn, parse_dates=['ts_start'])
-        if df_mark.empty:
-            logging.error("No hay datos de precios en mark_price_vwap para los activos.")
-            conn.close()
-            return None
-        # Pivotar para tener columnas separadas para cada símbolo
-        df_mark_pivot = df_mark.pivot(index='ts_start', columns='symbol_id', values='mark_price')
-        # Renombrar columnas para que coincidan con ASSET_Y_COL y ASSET_X_COL
-        df = df_mark_pivot.rename(columns={
-            params.ASSET_Y_COL: params.ASSET_Y_COL,
-            params.ASSET_X_COL: params.ASSET_X_COL
-        })
+        # Construct absolute path for pd.read_csv
+        absolute_filepath = os.path.join(BASE_DIR, filepath)
+        df_full = pd.read_csv(absolute_filepath, index_col=0, parse_dates=True)
 
-        # --- Obtener funding rates históricos para ambos símbolos ---
-        query_funding = f"""
-            SELECT ts AS ts, symbol, funding_rate
-            FROM mexc_funding_rate_history
-            WHERE symbol IN ('{params.ASSET_Y_COL}', '{params.ASSET_X_COL}')
-        """
-        df_funding = pd.read_sql_query(query_funding, conn, parse_dates=['ts'])
-        conn.close()
+        # Select only necessary columns (asset Y, asset X, and optionally funding rates)
+        cols_to_keep = [params.ASSET_Y_COL, params.ASSET_X_COL]
+        if 'funding_rate_y' in df_full.columns:
+            cols_to_keep.append('funding_rate_y')
+        if 'funding_rate_x' in df_full.columns:
+            cols_to_keep.append('funding_rate_x')
 
-        df_funding_y = (
-            df_funding[df_funding['symbol'] == params.ASSET_Y_COL]
-            .set_index('ts')[['funding_rate']]
-            .rename(columns={'funding_rate': 'funding_rate_y'})
-        )
-        df_funding_x = (
-            df_funding[df_funding['symbol'] == params.ASSET_X_COL]
-            .set_index('ts')[['funding_rate']]
-            .rename(columns={'funding_rate': 'funding_rate_x'})
-        )
+        df = df_full[cols_to_keep].copy() # Use .copy() to avoid SettingWithCopyWarning
 
-        # Unir las funding rates y rellenar con 0 donde falten datos
-        df = (
-            df.join(df_funding_y, how="left")
-              .join(df_funding_x, how="left")
-              .fillna({"funding_rate_y": 0.0, "funding_rate_x": 0.0})
-        )
+        # Ensure funding rate columns exist, fill with 0.0 if not
+        if 'funding_rate_y' not in df.columns:
+            df['funding_rate_y'] = 0.0
+        if 'funding_rate_x' not in df.columns:
+            df['funding_rate_x'] = 0.0
+
         df.sort_index(inplace=True)
-
-        # Eliminar filas sin datos de precio
         df.dropna(subset=[params.ASSET_Y_COL, params.ASSET_X_COL], inplace=True)
         if df.empty:
             logging.error("No hay datos después de eliminar NaNs iniciales.")
             return None
-
-        logging.info(
-            f"Datos cargados. Rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
-        )
+        logging.info(f"Datos CSV cargados. Rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}")
         return df
-    except sqlite3.Error as e:
-        logging.error(f"Error cargando datos desde BDD: {e}")
+    except FileNotFoundError:
+        logging.error(f"Error: Archivo CSV no encontrado en {absolute_filepath}")
+        return None
+    except Exception as e:
+        logging.error(f"Error cargando datos desde CSV: {e}")
         return None
 
-
-def calculate_rolling_ols_and_spread(df, asset_y_col, asset_x_col, window_periods):
+def calculate_rolling_ols_and_spread(df, asset_y_col, asset_x_col, window_periods, params_obj: StrategyParameters):
     """
     Rolling OLS based on statsmodels.RollingOLS (2.5) with
     rolling in-sample price normalisation (mean 0, std 1 for each window)
@@ -217,8 +909,8 @@ def calculate_rolling_ols_and_spread(df, asset_y_col, asset_x_col, window_period
 
     # --- Beta quality quick filters (2.1) ---
     df["beta_roll_std_20"] = df["beta"].rolling(20, min_periods=20).std()
-    df["beta_ok"] = df["beta"].abs().between(BETA_MIN_THRESHOLD, BETA_MAX_THRESHOLD) & (
-        df["beta_roll_std_20"] < BETA_ROLL_STD_MAX
+    df["beta_ok"] = df["beta"].abs().between(params_obj.BETA_MIN_THRESHOLD, params_obj.BETA_MAX_THRESHOLD) & (
+        df["beta_roll_std_20"] < params_obj.BETA_ROLL_STD_MAX
     )
 
     return df
@@ -231,712 +923,695 @@ def calculate_zscore(series, window_periods):
     mean = series.rolling(window=window_periods, min_periods=window_periods).mean()
     std = series.rolling(window=window_periods, min_periods=window_periods).std()
     z = (series - mean) / std
-    return z.replace([np.inf, -np.inf], np.nan)
-
-
-def apply_slippage(price, side, slippage_pct):
-    if side == "buy":
-        return price * (1 + slippage_pct)
-    elif side == "sell":
-        return price * (1 - slippage_pct)
-    return price
-
-
 # --- Lógica Principal del Backtest ---
-def run_backtest(df_input, **params):
-    # Allow external scripts to override any constant simply by passing
-    # keyword arguments, e.g. run_backtest(df, ENTRY_ZSCORE=2.0).
-    # The override is done once per call so a grid‑search can explore many
-    # combinations safely.
-    globals().update(params)
-    logging.info("Iniciando backtest...")
-    # --- Log strategy parameters for traceability ---
-    try:
-        # Gather all fields from StrategyParameters dataclass
-        param_keys = list(StrategyParameters.__annotations__.keys())
-        current_params = {key: globals().get(key) for key in param_keys}
-        logging.info(f"Estrategia parámetros: {current_params}")
-    except Exception as e:
-        logging.warning(f"No se pudieron registrar los parámetros de estrategia: {e}")
-    df = df_input.copy()
+# def run_backtest(df_input, params_obj: StrategyParameters):
+#     logging.info("Iniciando backtest...")
+#     # --- Log strategy parameters for traceability ---
+#     try:
+#         logging.info(f"Estrategia parámetros: {asdict(params_obj)}")
+#     except Exception as e:
+#         logging.warning(f"No se pudieron registrar los parámetros de estrategia: {e}")
+#     df = df_input.copy()
 
-    current_data_freq_minutes = DEFAULT_DATA_FREQ_MINUTES
-    if RESAMPLE_ALL_DATA_TO_MINUTES is not None and RESAMPLE_ALL_DATA_TO_MINUTES > 0:
-        logging.info(
-            f"Resampleando todos los datos a velas de {RESAMPLE_ALL_DATA_TO_MINUTES} minutos."
-        )
-        df = df.resample(f"{RESAMPLE_ALL_DATA_TO_MINUTES}min").last()
-        df.dropna(subset=[ASSET_Y_COL, ASSET_X_COL], inplace=True)
-        if df.empty:
-            logging.error("No hay datos después del resampleo general.")
-            return df, None, None
-        current_data_freq_minutes = RESAMPLE_ALL_DATA_TO_MINUTES
-        logging.info(
-            f"Datos resampleados. Nuevo rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
-        )
+#     current_data_freq_minutes = params_obj.DEFAULT_DATA_FREQ_MINUTES
+#     if params_obj.RESAMPLE_ALL_DATA_TO_MINUTES is not None and params_obj.RESAMPLE_ALL_DATA_TO_MINUTES > 0:
+#         logging.info(
+#             f"Resampleando todos los datos a velas de {params_obj.RESAMPLE_ALL_DATA_TO_MINUTES} minutos."
+#         )
+#         df = df.resample(f"{params_obj.RESAMPLE_ALL_DATA_TO_MINUTES}min").last()
+#         df.dropna(subset=[params_obj.ASSET_Y_COL, params_obj.ASSET_X_COL], inplace=True)
+#         if df.empty:
+#             logging.error("No hay datos después del resampleo general.")
+#             return df, None, None
+#         current_data_freq_minutes = params_obj.RESAMPLE_ALL_DATA_TO_MINUTES
+#         logging.info(
+#             f"Datos resampleados. Nuevo rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
+#         )
 
-    if current_data_freq_minutes <= 0:
-        logging.error(f"Frecuencia de datos ({current_data_freq_minutes}) inválida.")
-        return df, None, None
+#     if current_data_freq_minutes <= 0:
+#         logging.error(f"Frecuencia de datos ({current_data_freq_minutes}) inválida.")
+#         return df, None, None
 
-    periods_in_day = (24 * 60) / current_data_freq_minutes
-    ols_window_periods = int(OLS_WINDOW_DAYS * periods_in_day)
-    zscore_window_periods = int(ZSCORE_WINDOW_DAYS * periods_in_day)
+#     periods_in_day = (24 * 60) / current_data_freq_minutes
+#     ols_window_periods = int(params_obj.OLS_WINDOW_DAYS * periods_in_day)
+#     zscore_window_periods = int(params_obj.ZSCORE_WINDOW_DAYS * periods_in_day)
 
-    logging.info(f"Frecuencia de datos para cálculos: {current_data_freq_minutes} min.")
-    logging.info(
-        f"Ventana OLS: {OLS_WINDOW_DAYS} días = {ols_window_periods} periodos."
-    )
-    logging.info(
-        f"Ventana Z-Score: {ZSCORE_WINDOW_DAYS} días = {zscore_window_periods} periodos."
-    )
+#     logging.info(f"Frecuencia de datos para cálculos: {current_data_freq_minutes} min.")
+#     logging.info(
+#         f"Ventana OLS: {params_obj.OLS_WINDOW_DAYS} días = {ols_window_periods} periodos."
+#     )
+#     logging.info(
+#         f"Ventana Z-Score: {params_obj.ZSCORE_WINDOW_DAYS} días = {zscore_window_periods} periodos."
+#     )
 
-    df = calculate_rolling_ols_and_spread(
-        df, ASSET_Y_COL, ASSET_X_COL, ols_window_periods
-    )
-    df["z_score"] = calculate_zscore(df["spread"], zscore_window_periods)
+#     df = calculate_rolling_ols_and_spread(
+#         df, params_obj.ASSET_Y_COL, params_obj.ASSET_X_COL, ols_window_periods, params_obj
+#     )
+#     df["z_score"] = calculate_zscore(df["spread"], zscore_window_periods)
 
-    df.dropna(
-        subset=["alpha", "beta", "beta_p_value", "ols_r_squared", "spread", "z_score"],
-        inplace=True,
-    )
-    if df.empty:
-        logging.error(
-            "No hay datos válidos después de calcular OLS (incl. p-value y R² de beta) y Z-score."
-        )
-        return df, None, None
+#     df.dropna(
+#         subset=["alpha", "beta", "beta_p_value", "ols_r_squared", "spread", "z_score"],
+#         inplace=True,
+#     )
+#     if df.empty:
+#         logging.error(
+#             "No hay datos válidos después de calcular OLS (incl. p-value y R² de beta) y Z-score."
+#         )
+#         return df, None, None
 
-    equity = INITIAL_CAPITAL
-    equity_curve = pd.Series(index=df.index, dtype=float)
-    trades_log = []
+#     equity = params_obj.INITIAL_CAPITAL
+#     equity_curve = pd.Series(index=df.index, dtype=float)
+#     trades_log = []
 
-    current_position = None
-    position_entry_market_price_y = None
-    position_entry_market_price_x = None
-    position_entry_exec_price_y = None
-    position_entry_exec_price_x = None
-    position_qty_y = 0
-    position_qty_x = 0
-    position_entry_alpha = None
-    position_entry_beta = None
-    position_entry_time = None
-    position_entry_zscore_value = None
-    position_entry_spread_value = None
-    is_leg_x_long = None
-    position_equity_base_for_pnl_stop = None  # NUEVO: Equity base para P&L Stop
-    position_total_entry_fees = None  # NUEVO: Comisiones de entrada del trade actual
-    trail_peak_pnl = None  # máx. PnL neto observado para trailing‑stop
+#     current_position = None
+#     position_entry_market_price_y = None
+#     position_entry_market_price_x = None
+#     position_entry_exec_price_y = None
+#     position_entry_exec_price_x = None
+#     position_qty_y = 0
+#     position_qty_x = 0
+#     position_entry_alpha = None
+#     position_entry_beta = None
+#     position_entry_time = None
+#     position_entry_zscore_value = None
+#     position_entry_spread_value = None
+#     is_leg_x_long = None
+#     position_equity_base_for_pnl_stop = None  # NUEVO: Equity base para P&L Stop
+#     position_total_entry_fees = None  # NUEVO: Comisiones de entrada del trade actual
+#     trail_peak_pnl = None  # máx. PnL neto observado para trailing‑stop
 
-    sl_cooldown_until = None
-    z_signal_active = False  # Flag to avoid repeated skip logs for the same signal
+#     sl_cooldown_until = None
+#     z_signal_active = False  # Flag to avoid repeated skip logs for the same signal
 
-    for timestamp, row in df.iterrows():
-        z_score_val = row["z_score"]
-        # --- Funding cash‑flow ------------------------------------------------
-        if current_position:
-            # Y‑leg
-            fr_y = row.get("funding_rate_y", 0.0)
-            if fr_y:
-                dir_y = 1 if current_position == "long_spread" else -1
-                notional_y = position_qty_y * row[ASSET_Y_COL]
-                funding_y_amount = fr_y * notional_y * dir_y
-                equity -= funding_y_amount
-                logging.debug(
-                    f"{timestamp}: Funding Y leg: fr_y={fr_y:.6f}, notional_y={notional_y:.2f}, dir={dir_y}, amount={funding_y_amount:.2f}"
-                )
+#     for timestamp, row in df.iterrows():
+#         z_score_val = row["z_score"]
+#         # --- Funding cash‑flow ------------------------------------------------
+#         if current_position:
+#             # Y‑leg
+#             fr_y = row.get("funding_rate_y", 0.0)
+#             if fr_y:
+#                 dir_y = 1 if current_position == "long_spread" else -1
+#                 notional_y = position_qty_y * row[params_obj.ASSET_Y_COL]
+#                 funding_y_amount = fr_y * notional_y * dir_y
+#                 equity -= funding_y_amount
+#                 logging.debug(
+#                     f"{timestamp}: Funding Y leg: fr_y={fr_y:.6f}, notional_y={notional_y:.2f}, dir={dir_y}, amount={funding_y_amount:.2f}"
+#                 )
 
-            # X‑leg
-            fr_x = row.get("funding_rate_x", 0.0)
-            if fr_x:
-                dir_x = 1 if is_leg_x_long else -1
-                notional_x = position_qty_x * row[ASSET_X_COL]
-                funding_x_amount = fr_x * notional_x * dir_x
-                equity -= funding_x_amount
-                logging.debug(
-                    f"{timestamp}: Funding X leg: fr_x={fr_x:.6f}, notional_x={notional_x:.2f}, dir={dir_x}, amount={funding_x_amount:.2f}"
-                )
-        # ---------------------------------------------------------------------
+#             # X‑leg
+#             fr_x = row.get("funding_rate_x", 0.0)
+#             if fr_x:
+#                 dir_x = 1 if is_leg_x_long else -1
+#                 notional_x = position_qty_x * row[params_obj.ASSET_X_COL]
+#                 funding_x_amount = fr_x * notional_x * dir_x
+#                 equity -= funding_x_amount
+#                 logging.debug(
+#                     f"{timestamp}: Funding X leg: fr_x={fr_x:.6f}, notional_x={notional_x:.2f}, dir={dir_x}, amount={funding_x_amount:.2f}"
+#                 )
+#         # ---------------------------------------------------------------------
 
-        # --- Mark‑to‑Market valuation (realised + floating PnL) ---
-        portfolio_value = equity
-        if current_position:
-            price_y = row[ASSET_Y_COL]
-            price_x = row[ASSET_X_COL]
+#         # --- Mark‑to‑Market valuation (realised + floating PnL) ---
+#         portfolio_value = equity
+#         if current_position:
+#             price_y = row[params_obj.ASSET_Y_COL]
+#             price_x = row[params_obj.ASSET_X_COL]
 
-            # Floating PnL for Y‑leg
-            if current_position == "long_spread":
-                pnl_y_float = (price_y - position_entry_exec_price_y) * position_qty_y
-            else:  # short_spread
-                pnl_y_float = (position_entry_exec_price_y - price_y) * position_qty_y
+#             # Floating PnL for Y‑leg
+#             if current_position == "long_spread":
+#                 pnl_y_float = (price_y - position_entry_exec_price_y) * position_qty_y
+#             else:  # short_spread
+#                 pnl_y_float = (position_entry_exec_price_y - price_y) * position_qty_y
 
-            # Floating PnL for X‑leg
-            if is_leg_x_long:
-                pnl_x_float = (price_x - position_entry_exec_price_x) * position_qty_x
-            else:
-                pnl_x_float = (position_entry_exec_price_x - price_x) * position_qty_x
+#             # Floating PnL for X‑leg
+#             if is_leg_x_long:
+#                 pnl_x_float = (price_x - position_entry_exec_price_x) * position_qty_x
+#             else:
+#                 pnl_x_float = (position_entry_exec_price_x - price_x) * position_qty_x
 
-            portfolio_value += pnl_y_float + pnl_x_float
+#             portfolio_value += pnl_y_float + pnl_x_float
 
-        # Record the marked‑to‑market portfolio value for drawdown stats
-        equity_curve[timestamp] = portfolio_value
+#         # Record the marked‑to‑market portfolio value for drawdown stats
+#         equity_curve[timestamp] = portfolio_value
 
-        if sl_cooldown_until and timestamp < sl_cooldown_until:
-            logging.debug(
-                f"{timestamp}: Skipping iteration due to cooldown until {sl_cooldown_until}"
-            )
-            continue
-        elif sl_cooldown_until and timestamp >= sl_cooldown_until:
-            logging.debug(f"{timestamp}: Cooldown por SL finalizado.")
-            sl_cooldown_until = None
+#         if sl_cooldown_until and timestamp < sl_cooldown_until:
+#             logging.debug(
+#                 f"{timestamp}: Skipping iteration due to cooldown until {sl_cooldown_until}"
+#             )
+#             continue
+#         elif sl_cooldown_until and timestamp >= sl_cooldown_until:
+#             logging.debug(f"{timestamp}: Cooldown por SL finalizado.")
+#             sl_cooldown_until = None
 
-        if (
-            pd.isna(z_score_val)
-            or pd.isna(row["beta"])
-            or pd.isna(row["alpha"])
-            or pd.isna(row["beta_p_value"])
-            or pd.isna(row["ols_r_squared"])
-        ):
-            continue
+#         if (
+#             pd.isna(z_score_val)
+#             or pd.isna(row["beta"])
+#             or pd.isna(row["alpha"])
+#             or pd.isna(row["beta_p_value"])
+#             or pd.isna(row["ols_r_squared"])
+#         ):
+#             continue
 
-        # --- GESTIÓN DE POSICIONES ABIERTAS ---
-        if current_position:
-            exit_signal = False
-            exit_reason = None
+#         # --- GESTIÓN DE POSICIONES ABIERTAS ---
+#         if current_position:
+#             exit_signal = False
+#             exit_reason = None
 
-            # --- INICIO: NUEVO Stop-Loss por P&L ---
-            if (
-                PNL_STOP_LOSS_PCT > 0
-                and position_equity_base_for_pnl_stop is not None
-                and position_total_entry_fees is not None
-            ):
-                current_market_price_y_float = row[ASSET_Y_COL]
-                current_market_price_x_float = row[ASSET_X_COL]
-                pnl_y_float = 0
-                pnl_x_float = 0
+#             # --- INICIO: NUEVO Stop-Loss por P&L ---
+#             if (
+#                 params_obj.PNL_STOP_LOSS_PCT > 0
+#                 and position_equity_base_for_pnl_stop is not None
+#                 and position_total_entry_fees is not None
+#             ):
+#                 current_market_price_y_float = row[params_obj.ASSET_Y_COL]
+#                 current_market_price_x_float = row[params_obj.ASSET_X_COL]
+#                 pnl_y_float = 0
+#                 pnl_x_float = 0
 
-                if pd.isna(current_market_price_y_float) or pd.isna(
-                    current_market_price_x_float
-                ):
-                    logging.warning(
-                        f"{timestamp}: Precio de mercado NaN para P&L flotante. Y: {current_market_price_y_float}, X: {current_market_price_x_float}. Saltando P&L Stop check esta barra."
-                    )
-                else:
-                    if current_position == "long_spread":
-                        pnl_y_float = (
-                            current_market_price_y_float - position_entry_exec_price_y
-                        ) * position_qty_y
-                    else:  # short_spread
-                        pnl_y_float = (
-                            position_entry_exec_price_y - current_market_price_y_float
-                        ) * position_qty_y
+#                 if pd.isna(current_market_price_y_float) or pd.isna(
+#                     current_market_price_x_float
+#                 ):
+#                     logging.warning(
+#                         f"{timestamp}: Precio de mercado NaN para P&L flotante. Y: {current_market_price_y_float}, X: {current_market_price_x_float}. Saltando P&L Stop check esta barra."
+#                     )
+#                 else:
+#                     if current_position == "long_spread":
+#                         pnl_y_float = (
+#                             current_market_price_y_float - position_entry_exec_price_y
+#                         ) * position_qty_y
+#                     else:  # short_spread
+#                         pnl_y_float = (
+#                             position_entry_exec_price_y - current_market_price_y_float
+#                         ) * position_qty_y
 
-                    if is_leg_x_long:
-                        pnl_x_float = (
-                            current_market_price_x_float - position_entry_exec_price_x
-                        ) * position_qty_x
-                    else:  # short_spread_x
-                        pnl_x_float = (
-                            position_entry_exec_price_x - current_market_price_x_float
-                        ) * position_qty_x
+#                     if is_leg_x_long:
+#                         pnl_x_float = (
+#                             current_market_price_x_float - position_entry_exec_price_x
+#                         ) * position_qty_x
+#                     else:  # short_spread_x
+#                         pnl_x_float = (
+#                             position_entry_exec_price_x - current_market_price_x_float
+#                         ) * position_qty_x
 
-                    floating_pnl_gross = pnl_y_float + pnl_x_float
-                    floating_pnl_net_after_entry_costs = (
-                        floating_pnl_gross - position_total_entry_fees
-                    )
-                    max_loss_for_trade = (
-                        position_equity_base_for_pnl_stop * PNL_STOP_LOSS_PCT
-                    )
+#                     floating_pnl_gross = pnl_y_float + pnl_x_float
+#                     floating_pnl_net_after_entry_costs = (
+#                         floating_pnl_gross - position_total_entry_fees
+#                     )
+#                     max_loss_for_trade = (
+#                         position_equity_base_for_pnl_stop * params_obj.PNL_STOP_LOSS_PCT
+#                     )
 
-                    # Log floating PnL details for P&L Stop-Loss
-                    logging.debug(
-                        f"{timestamp}: Floating PnL gross: {floating_pnl_gross:.2f}, "
-                        f"net after entry fees: {floating_pnl_net_after_entry_costs:.2f}, "
-                        f"max_loss_allowed: {max_loss_for_trade:.2f}"
-                    )
+#                     # Log floating PnL details for P&L Stop-Loss
+#                     logging.debug(
+#                         f"{timestamp}: Floating PnL gross: {floating_pnl_gross:.2f}, "
+#                         f"net after entry fees: {floating_pnl_net_after_entry_costs:.2f}, "
+#                         f"max_loss_allowed: {max_loss_for_trade:.2f}"
+#                     )
 
-                    if floating_pnl_net_after_entry_costs < -max_loss_for_trade:
-                        exit_signal = True
-                        exit_reason = f"P&L Stop Loss ({floating_pnl_net_after_entry_costs:.2f} < -{max_loss_for_trade:.2f})"
-                        sl_cooldown_until = timestamp + timedelta(
-                            hours=SL_COOLDOWN_HOURS
-                        )
-                        logging.warning(
-                            f"{timestamp}: P&L Stop Loss activado para {current_position}. PnL Flotante Neto: {floating_pnl_net_after_entry_costs:.2f}. Cooldown hasta {sl_cooldown_until}"
-                        )
+#                     if floating_pnl_net_after_entry_costs < -max_loss_for_trade:
+#                         exit_signal = True
+#                         exit_reason = f"P&L Stop Loss ({floating_pnl_net_after_entry_costs:.2f} < -{max_loss_for_trade:.2f})"
+#                         sl_cooldown_until = timestamp + timedelta(
+#                             hours=params_obj.SL_COOLDOWN_HOURS
+#                         )
+#                         logging.warning(
+#                             f"{timestamp}: P&L Stop Loss activado para {current_position}. PnL Flotante Neto: {floating_pnl_net_after_entry_costs:.2f}. Cooldown hasta {sl_cooldown_until}"
+#                         )
 
-                    # --- Trailing‑stop check ---
-                    if floating_pnl_net_after_entry_costs > 0:
-                        if (
-                            trail_peak_pnl is None
-                            or floating_pnl_net_after_entry_costs > trail_peak_pnl
-                        ):
-                            trail_peak_pnl = floating_pnl_net_after_entry_costs
-                        elif (
-                            trail_peak_pnl - floating_pnl_net_after_entry_costs
-                        ) > trail_peak_pnl * TRAIL_STOP_PCT:
-                            exit_signal = True
-                            exit_reason = (
-                                f"Trailing Stop ({floating_pnl_net_after_entry_costs:.2f} < "
-                                f"{trail_peak_pnl*(1-TRAIL_STOP_PCT):.2f})"
-                            )
-                            sl_cooldown_until = timestamp + timedelta(
-                                hours=SL_COOLDOWN_HOURS
-                            )
-                            logging.warning(
-                                f"{timestamp}: Trailing‑stop activado. Cooldown hasta {sl_cooldown_until}"
-                            )
-                    # -----------------------------------------------------------
-            # --- FIN: NUEVO Stop-Loss por P&L ---
+#                     # --- Trailing‑stop check ---
+#                     if floating_pnl_net_after_entry_costs > 0:
+#                         if (
+#                             trail_peak_pnl is None
+#                             or floating_pnl_net_after_entry_costs > trail_peak_pnl
+#                         ):
+#                             trail_peak_pnl = floating_pnl_net_after_entry_costs
+#                         elif (
+#                             trail_peak_pnl - floating_pnl_net_after_entry_costs
+#                         ) > trail_peak_pnl * params_obj.TRAIL_STOP_PCT:
+#                             exit_signal = True
+#                             exit_reason = (
+#                                 f"Trailing Stop ({floating_pnl_net_after_entry_costs:.2f} < "
+#                                 f"{trail_peak_pnl*(1-params_obj.TRAIL_STOP_PCT):.2f})"
+#                             )
+#                             sl_cooldown_until = timestamp + timedelta(
+#                                 hours=params_obj.SL_COOLDOWN_HOURS
+#                             )
+#                             logging.warning(
+#                                 f"{timestamp}: Trailing‑stop activado. Cooldown hasta {sl_cooldown_until}"
+#                             )
+#                     # -----------------------------------------------------------
+#             # --- FIN: NUEVO Stop-Loss por P&L ---
 
-            if not exit_signal:  # Solo comprobar Z-Score si P&L Stop no se activó
-                if (
-                    current_position == "long_spread" and z_score_val >= -EXIT_ZSCORE
-                ) or (
-                    current_position == "short_spread" and z_score_val <= EXIT_ZSCORE
-                ):
-                    exit_signal = True
-                    exit_reason = f"Z-Score Reversion ({z_score_val:.2f})"
-                elif (
-                    current_position == "long_spread"
-                    and z_score_val <= -STOP_LOSS_ZSCORE
-                ) or (
-                    current_position == "short_spread"
-                    and z_score_val >= STOP_LOSS_ZSCORE
-                ):
-                    exit_signal = True
-                    exit_reason = f"Z-Score SL ({z_score_val:.2f})"  # Modificado
-                    sl_cooldown_until = timestamp + timedelta(hours=SL_COOLDOWN_HOURS)
-                    logging.warning(
-                        f"{timestamp}: Z-Score Stop Loss activado. Cooldown hasta {sl_cooldown_until}"
-                    )
+#             if not exit_signal:  # Solo comprobar Z-Score si P&L Stop no se activó
+#                 if (
+#                     current_position == "long_spread" and z_score_val >= -params_obj.EXIT_ZSCORE
+#                 ) or (
+#                     current_position == "short_spread" and z_score_val <= params_obj.EXIT_ZSCORE
+#                 ):
+#                     exit_signal = True
+#                     exit_reason = f"Z-Score Reversion ({z_score_val:.2f})"
+#                 elif (
+#                     current_position == "long_spread"
+#                     and z_score_val <= -params_obj.STOP_LOSS_ZSCORE
+#                 ) or (
+#                     current_position == "short_spread"
+#                     and z_score_val >= params_obj.STOP_LOSS_ZSCORE
+#                 ):
+#                     exit_signal = True
+#                     exit_reason = f"Z-Score SL ({z_score_val:.2f})"  # Modificado
+#                     sl_cooldown_until = timestamp + timedelta(hours=params_obj.SL_COOLDOWN_HOURS)
+#                     logging.warning(
+#                         f"{timestamp}: Z-Score Stop Loss activado. Cooldown hasta {sl_cooldown_until}"
+#                     )
 
-            if exit_signal:
-                market_price_y_exit = row[ASSET_Y_COL]
-                market_price_x_exit = row[ASSET_X_COL]
-                spread_value_at_exit = row["spread"]
+#             if exit_signal:
+#                 market_price_y_exit = row[params_obj.ASSET_Y_COL]
+#                 market_price_x_exit = row[params_obj.ASSET_X_COL]
+#                 spread_value_at_exit = row["spread"]
 
-                if current_position == "long_spread":
-                    exec_price_y_exit = apply_slippage(
-                        market_price_y_exit, "sell", SLIPPAGE_PCT
-                    )
-                    pnl_y = (
-                        exec_price_y_exit - position_entry_exec_price_y
-                    ) * position_qty_y
-                else:
-                    exec_price_y_exit = apply_slippage(
-                        market_price_y_exit, "buy", SLIPPAGE_PCT
-                    )
-                    pnl_y = (
-                        position_entry_exec_price_y - exec_price_y_exit
-                    ) * position_qty_y
+#                 if current_position == "long_spread":
+#                     exec_price_y_exit = apply_slippage(
+#                         market_price_y_exit, "sell", params_obj.SLIPPAGE_PCT
+#                     )
+#                     pnl_y = (
+#                         exec_price_y_exit - position_entry_exec_price_y
+#                     ) * position_qty_y
+#                 else:
+#                     exec_price_y_exit = apply_slippage(
+#                         market_price_y_exit, "buy", params_obj.SLIPPAGE_PCT
+#                     )
+#                     pnl_y = (
+#                         position_entry_exec_price_y - exec_price_y_exit
+#                     ) * position_qty_y
 
-                if is_leg_x_long:
-                    exec_price_x_exit = apply_slippage(
-                        market_price_x_exit, "sell", SLIPPAGE_PCT
-                    )
-                    pnl_x = (
-                        exec_price_x_exit - position_entry_exec_price_x
-                    ) * position_qty_x
-                else:
-                    exec_price_x_exit = apply_slippage(
-                        market_price_x_exit, "buy", SLIPPAGE_PCT
-                    )
-                    pnl_x = (
-                        position_entry_exec_price_x - exec_price_x_exit
-                    ) * position_qty_x
+#                 if is_leg_x_long:
+#                     exec_price_x_exit = apply_slippage(
+#                         market_price_x_exit, "sell", params_obj.SLIPPAGE_PCT
+#                     )
+#                     pnl_x = (
+#                         exec_price_x_exit - position_entry_exec_price_x
+#                     ) * position_qty_x
+#                 else:
+#                     exec_price_x_exit = apply_slippage(
+#                         market_price_x_exit, "buy", params_obj.SLIPPAGE_PCT
+#                     )
+#                     pnl_x = (
+#                         position_entry_exec_price_x - exec_price_x_exit
+#                     ) * position_qty_x
 
-                slippage_cost_y_exit = (
-                    abs(exec_price_y_exit - market_price_y_exit) * position_qty_y
-                )
-                slippage_cost_x_exit = (
-                    abs(exec_price_x_exit - market_price_x_exit) * position_qty_x
-                )
+#                 slippage_cost_y_exit = (
+#                     abs(exec_price_y_exit - market_price_y_exit) * position_qty_y
+#                 )
+#                 slippage_cost_x_exit = (
+#                     abs(exec_price_x_exit - market_price_x_exit) * position_qty_x
+#                 )
 
-                fee_cost_y_exit = abs(
-                    exec_price_y_exit * position_qty_y * TAKER_FEE_PCT
-                )
-                fee_cost_x_exit = abs(
-                    exec_price_x_exit * position_qty_x * TAKER_FEE_PCT
-                )
-                total_fees_exit = fee_cost_y_exit + fee_cost_x_exit
+#                 fee_cost_y_exit = abs(
+#                     exec_price_y_exit * position_qty_y * params_obj.TAKER_FEE_PCT
+#                 )
+#                 fee_cost_x_exit = abs(
+#                     exec_price_x_exit * position_qty_x * params_obj.TAKER_FEE_PCT
+#                 )
+#                 total_fees_exit = fee_cost_y_exit + fee_cost_x_exit
 
-                pnl_trade_gross = pnl_y + pnl_x
-                pnl_trade_net_this_exit_leg = pnl_trade_gross - total_fees_exit
+#                 pnl_trade_gross = pnl_y + pnl_x
+#                 pnl_trade_net_this_exit_leg = pnl_trade_gross - total_fees_exit
 
-                equity += pnl_trade_net_this_exit_leg
-                equity_curve[timestamp] = equity
+#                 equity += pnl_trade_net_this_exit_leg
+#                 equity_curve[timestamp] = equity
 
-                final_trade_pnl_net_calculated = 0
-                updated_in_log = False
-                for i in range(len(trades_log) - 1, -1, -1):
-                    if (
-                        trades_log[i]["exit_time"] is None
-                        and trades_log[i]["position_type"] == current_position
-                    ):
-                        trades_log[i].update(
-                            {
-                                "exit_time": timestamp,
-                                "exit_zscore": z_score_val,
-                                "reason_exit": exit_reason,
-                                "market_price_y_exit": market_price_y_exit,
-                                "exec_price_y_exit": exec_price_y_exit,
-                                "pnl_y": pnl_y,
-                                "market_price_x_exit": market_price_x_exit,
-                                "exec_price_x_exit": exec_price_x_exit,
-                                "pnl_x": pnl_x,
-                                "slippage_cost_y_exit": slippage_cost_y_exit,
-                                "slippage_cost_x_exit": slippage_cost_x_exit,
-                                "fee_cost_y_exit": fee_cost_y_exit,
-                                "fee_cost_x_exit": fee_cost_x_exit,
-                                "spread_value_at_exit": spread_value_at_exit,
-                                "total_pnl_gross": pnl_trade_gross,
-                                "total_fees": trades_log[i]["entry_fees_total"]
-                                + total_fees_exit,
-                                "equity_after_trade": equity,
-                            }
-                        )
-                        trades_log[i]["final_trade_pnl_net"] = (
-                            trades_log[i]["total_pnl_gross"]
-                            - trades_log[i]["total_fees"]
-                        )
-                        final_trade_pnl_net_calculated = trades_log[i][
-                            "final_trade_pnl_net"
-                        ]
-                        updated_in_log = True
-                        break
-                if not updated_in_log:
-                    logging.error(
-                        f"Error: No se encontró trade abierto {current_position} para actualizar en {timestamp}"
-                    )
+#                 final_trade_pnl_net_calculated = 0
+#                 updated_in_log = False
+#                 for i in range(len(trades_log) - 1, -1, -1):
+#                     if (
+#                         trades_log[i]["exit_time"] is None
+#                         and trades_log[i]["position_type"] == current_position
+#                     ):
+#                         trades_log[i].update(
+#                             {
+#                                 "exit_time": timestamp,
+#                                 "exit_zscore": z_score_val,
+#                                 "reason_exit": exit_reason,
+#                                 "market_price_y_exit": market_price_y_exit,
+#                                 "exec_price_y_exit": exec_price_y_exit,
+#                                 "pnl_y": pnl_y,
+#                                 "market_price_x_exit": market_price_x_exit,
+#                                 "exec_price_x_exit": exec_price_x_exit,
+#                                 "pnl_x": pnl_x,
+#                                 "slippage_cost_y_exit": slippage_cost_y_exit,
+#                                 "slippage_cost_x_exit": slippage_cost_x_exit,
+#                                 "fee_cost_y_exit": fee_cost_y_exit,
+#                                 "fee_cost_x_exit": fee_cost_x_exit,
+#                                 "spread_value_at_exit": spread_value_at_exit,
+#                                 "total_pnl_gross": pnl_trade_gross,
+#                                 "total_fees": trades_log[i]["entry_fees_total"]
+#                                 + total_fees_exit,
+#                                 "equity_after_trade": equity,
+#                             }
+#                         )
+#                         trades_log[i]["final_trade_pnl_net"] = (
+#                             trades_log[i]["total_pnl_gross"]
+#                             - trades_log[i]["total_fees"]
+#                         )
+#                         final_trade_pnl_net_calculated = trades_log[i][
+#                             "final_trade_pnl_net"
+#                         ]
+#                         updated_in_log = True
+#                         break
+#                 if not updated_in_log:
+#                     logging.error(
+#                         f"Error: No se encontró trade abierto {current_position} para actualizar en {timestamp}"
+#                     )
 
-                logging.info(
-                    f"TRADE CLOSED: {current_position} | Reason: {exit_reason} | PnL Net: {final_trade_pnl_net_calculated:.2f} | Equity: {equity:.2f} | "
-                    f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_exit:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_exit:.4f}) | "
-                    f"Fees Exit: {total_fees_exit:.2f}, Slip Exit Y: {slippage_cost_y_exit:.2f}, Slip Exit X: {slippage_cost_x_exit:.2f}"
-                )
-                # Log net PnL per leg after slippage and fees
-                net_pnl_y = pnl_y - slippage_cost_y_exit - fee_cost_y_exit
-                net_pnl_x = pnl_x - slippage_cost_x_exit - fee_cost_x_exit
-                logging.info(
-                    f"{timestamp}: Net PnL per leg: Y={net_pnl_y:.2f}, X={net_pnl_x:.2f}"
-                )
+#                 logging.info(
+#                     f"TRADE CLOSED: {current_position} | Reason: {exit_reason} | PnL Net: {final_trade_pnl_net_calculated:.2f} | Equity: {equity:.2f} | "
+#                     f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_exit:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_exit:.4f}) | "
+#                     f"Fees Exit: {total_fees_exit:.2f}, Slip Exit Y: {slippage_cost_y_exit:.2f}, Slip Exit X: {slippage_cost_x_exit:.2f}"
+#                 )
+#                 # Log net PnL per leg after slippage and fees
+#                 net_pnl_y = pnl_y - slippage_cost_y_exit - fee_cost_y_exit
+#                 net_pnl_x = pnl_x - slippage_cost_x_exit - fee_cost_x_exit
+#                 logging.info(
+#                     f"{timestamp}: Net PnL per leg: Y={net_pnl_y:.2f}, X={net_pnl_x:.2f}"
+#                 )
 
-                current_position = None
-                is_leg_x_long = None
-                position_equity_base_for_pnl_stop = None  # Resetear
-                position_total_entry_fees = None  # Resetear
-                trail_peak_pnl = None
+#                 current_position = None
+#                 is_leg_x_long = None
+#                 position_equity_base_for_pnl_stop = None  # Resetear
+#                 position_total_entry_fees = None  # Resetear
+#                 trail_peak_pnl = None
 
-                if (
-                    "SL" in exit_reason or "Stop Loss" in exit_reason
-                ):  # Modificado para cubrir ambos tipos de stop
-                    continue
+#                 if (
+#                     "SL" in exit_reason or "Stop Loss" in exit_reason
+#                 ):  # Modificado para cubrir ambos tipos de stop
+#                     continue
 
-        # --- LÓGICA DE APERTURA DE POSICIÓN ---
-        if not current_position:
-            # Skip if still in cooldown
-            if sl_cooldown_until and timestamp < sl_cooldown_until:
-                continue
-            # Check if Z-score triggers an entry signal
-            z_signal = (
-                z_score_val < -ENTRY_ZSCORE and z_score_val > -STOP_LOSS_ZSCORE
-            ) or (z_score_val > ENTRY_ZSCORE and z_score_val < STOP_LOSS_ZSCORE)
-            if not z_signal:
-                # Reset on no signal
-                z_signal_active = False
-                continue
-            # If this is the first bar of the signal, allow logging; otherwise skip
-            if z_signal_active:
-                continue
-            z_signal_active = True
-            # From here, proceed to filter checks and potential trade entry
-            if (
-                row["beta_p_value"] >= BETA_P_VALUE_THRESHOLD
-                or row["ols_r_squared"] < MIN_OLS_R_SQUARED_THRESHOLD
-            ):
-                logging.debug(
-                    f"{timestamp}: Skipping trade: beta_p_value={row['beta_p_value']:.4f} (threshold {BETA_P_VALUE_THRESHOLD}), ols_r_squared={row['ols_r_squared']:.4f} (threshold {MIN_OLS_R_SQUARED_THRESHOLD})"
-                )
-                continue
+#         # --- LÓGICA DE APERTURA DE POSICIÓN ---
+#         if not current_position:
+#             # Skip if still in cooldown
+#             if sl_cooldown_until and timestamp < sl_cooldown_until:
+#                 continue
+#             # Check if Z-score triggers an entry signal
+#             z_signal = (
+#                 z_score_val < -params_obj.ENTRY_ZSCORE and z_score_val > -params_obj.STOP_LOSS_ZSCORE
+#             ) or (z_score_val > params_obj.ENTRY_ZSCORE and z_score_val < params_obj.STOP_LOSS_ZSCORE)
+#             if not z_signal:
+#                 # Reset on no signal
+#                 z_signal_active = False
+#                 continue
+#             # If this is the first bar of the signal, allow logging; otherwise skip
+#             if z_signal_active:
+#                 continue
+#             z_signal_active = True
+#             # From here, proceed to filter checks and potential trade entry
+#             if (
+#                 row["beta_p_value"] >= params_obj.BETA_P_VALUE_THRESHOLD
+#                 or row["ols_r_squared"] < params_obj.MIN_OLS_R_SQUARED_THRESHOLD
+#             ):
+#                 logging.debug(
+#                     f"{timestamp}: Skipping trade: beta_p_value={row['beta_p_value']:.4f} (threshold {params_obj.BETA_P_VALUE_THRESHOLD}), ols_r_squared={row['ols_r_squared']:.4f} (threshold {params_obj.MIN_OLS_R_SQUARED_THRESHOLD})"
+#                 )
+#                 continue
 
-            # Skip if beta quality filter fails (2.1)
-            if not row.get("beta_ok", False):
-                logging.debug(
-                    f"{timestamp}: Skipping trade: beta_ok False (beta={row['beta']:.4f} thresholds [{BETA_MIN_THRESHOLD}, {BETA_MAX_THRESHOLD}], beta_roll_std_20={row['beta_roll_std_20']:.4f} threshold {BETA_ROLL_STD_MAX})"
-                )
-                continue
+#             # Skip if beta quality filter fails (2.1)
+#             if not row.get("beta_ok", False):
+#                 logging.debug(
+#                     f"{timestamp}: Skipping trade: beta_ok False (beta={row['beta']:.4f} thresholds [{params_obj.BETA_MIN_THRESHOLD}, {params_obj.BETA_MAX_THRESHOLD}], beta_roll_std_20={row['beta_roll_std_20']:.4f} threshold {params_obj.BETA_ROLL_STD_MAX})"
+#                 )
+#                 continue
 
-            # NUEVO: Guardar equity base para P&L stop y tamaño del trade
-            current_equity_base_for_trade_and_pnl_stop = equity
+#             # NUEVO: Guardar equity base para P&L stop y tamaño del trade
+#             current_equity_base_for_trade_and_pnl_stop = equity
 
-            trade_nominal_total = (
-                current_equity_base_for_trade_and_pnl_stop * POSITION_SIZE_PCT
-            )
-            beta_at_trade = row["beta"]
-            beta_abs = abs(beta_at_trade)
-            if (1 + beta_abs) == 0:
-                logging.warning(
-                    f"{timestamp}: beta_abs es tal que (1+beta_abs) es cero. Beta: {beta_at_trade}. Saltando trade."
-                )
-                continue
-            nominal_y_alloc = trade_nominal_total / (1 + beta_abs)
-            nominal_x_alloc = trade_nominal_total * beta_abs / (1 + beta_abs)
-            if (
-                nominal_y_alloc < MIN_NOMINAL_PER_LEG
-                or nominal_x_alloc < MIN_NOMINAL_PER_LEG
-            ):
-                logging.debug(
-                    f"{timestamp}: Skipping trade: nominal allocations too small: y={nominal_y_alloc:.2f}, x={nominal_x_alloc:.2f}, threshold={MIN_NOMINAL_PER_LEG}"
-                )
-                continue
+#             trade_nominal_total = (
+#                 current_equity_base_for_trade_and_pnl_stop * params_obj.POSITION_SIZE_PCT
+#             )
+#             beta_at_trade = row["beta"]
+#             beta_abs = abs(beta_at_trade)
+#             if (1 + beta_abs) == 0:
+#                 logging.warning(
+#                     f"{timestamp}: beta_abs es tal que (1+beta_abs) es cero. Beta: {beta_at_trade}. Saltando trade."
+#                 )
+#                 continue
+#             nominal_y_alloc = trade_nominal_total / (1 + beta_abs)
+#             nominal_x_alloc = trade_nominal_total * beta_abs / (1 + beta_abs)
+#             if (
+#                 nominal_y_alloc < params_obj.MIN_NOMINAL_PER_LEG
+#                 or nominal_x_alloc < params_obj.MIN_NOMINAL_PER_LEG
+#             ):
+#                 logging.debug(
+#                     f"{timestamp}: Skipping trade: nominal allocations too small: y={nominal_y_alloc:.2f}, x={nominal_x_alloc:.2f}, threshold={params_obj.MIN_NOMINAL_PER_LEG}"
+#                 )
+#                 continue
 
-            current_market_price_y_entry = row[ASSET_Y_COL]
-            current_market_price_x_entry = row[ASSET_X_COL]
-            current_spread_value_at_entry = row["spread"]
+#             current_market_price_y_entry = row[params_obj.ASSET_Y_COL]
+#             current_market_price_x_entry = row[params_obj.ASSET_X_COL]
+#             current_spread_value_at_entry = row["spread"]
 
-            if (
-                pd.isna(current_market_price_y_entry)
-                or pd.isna(current_market_price_x_entry)
-                or current_market_price_y_entry <= 0
-                or current_market_price_x_entry <= 0
-            ):
-                logging.warning(
-                    f"{timestamp}: Precio inválido para Y o X. Y: {current_market_price_y_entry}, X: {current_market_price_x_entry}. Saltando trade."
-                )
-                continue
+#             if (
+#                 pd.isna(current_market_price_y_entry)
+#                 or pd.isna(current_market_price_x_entry)
+#                 or current_market_price_y_entry <= 0
+#                 or current_market_price_x_entry <= 0
+#             ):
+#                 logging.warning(
+#                     f"{timestamp}: Precio inválido para Y o X. Y: {current_market_price_y_entry}, X: {current_market_price_x_entry}. Saltando trade."
+#                 )
+#                 continue
 
-            entry_type = None
-            current_is_leg_x_long = None
-            if z_score_val < -ENTRY_ZSCORE and z_score_val > -STOP_LOSS_ZSCORE:
-                entry_type = "long_spread"
-                exec_price_y_open = apply_slippage(
-                    current_market_price_y_entry, "buy", SLIPPAGE_PCT
-                )
-                if beta_at_trade < 0:
-                    exec_price_x_open = apply_slippage(
-                        current_market_price_x_entry, "buy", SLIPPAGE_PCT
-                    )
-                    current_is_leg_x_long = True
-                else:
-                    exec_price_x_open = apply_slippage(
-                        current_market_price_x_entry, "sell", SLIPPAGE_PCT
-                    )
-                    current_is_leg_x_long = False
-            elif z_score_val > ENTRY_ZSCORE and z_score_val < STOP_LOSS_ZSCORE:
-                entry_type = "short_spread"
-                exec_price_y_open = apply_slippage(
-                    current_market_price_y_entry, "sell", SLIPPAGE_PCT
-                )
-                if beta_at_trade < 0:
-                    exec_price_x_open = apply_slippage(
-                        current_market_price_x_entry, "sell", SLIPPAGE_PCT
-                    )
-                    current_is_leg_x_long = False
-                else:
-                    exec_price_x_open = apply_slippage(
-                        current_market_price_x_entry, "buy", SLIPPAGE_PCT
-                    )
-                    current_is_leg_x_long = True
+#             entry_type = None
+#             current_is_leg_x_long = None
+#             if z_score_val < -params_obj.ENTRY_ZSCORE and z_score_val > -params_obj.STOP_LOSS_ZSCORE:
+#                 entry_type = "long_spread"
+#                 exec_price_y_open = apply_slippage(
+#                     current_market_price_y_entry, "buy", params_obj.SLIPPAGE_PCT
+#                 )
+#                 if beta_at_trade < 0:
+#                     exec_price_x_open = apply_slippage(
+#                         current_market_price_x_entry, "buy", params_obj.SLIPPAGE_PCT
+#                     )
+#                     current_is_leg_x_long = True
+#                 else:
+#                     exec_price_x_open = apply_slippage(
+#                         current_market_price_x_entry, "sell", params_obj.SLIPPAGE_PCT
+#                     )
+#                     current_is_leg_x_long = False
+#             elif z_score_val > params_obj.ENTRY_ZSCORE and z_score_val < params_obj.STOP_LOSS_ZSCORE:
+#                 entry_type = "short_spread"
+#                 exec_price_y_open = apply_slippage(
+#                     current_market_price_y_entry, "sell", params_obj.SLIPPAGE_PCT
+#                 )
+#                 if beta_at_trade < 0:
+#                     exec_price_x_open = apply_slippage(
+#                         current_market_price_x_entry, "sell", params_obj.SLIPPAGE_PCT
+#                     )
+#                     current_is_leg_x_long = False
+#                 else:
+#                     exec_price_x_open = apply_slippage(
+#                         current_market_price_x_entry, "buy", params_obj.SLIPPAGE_PCT
+#                     )
+#                     current_is_leg_x_long = True
 
-            if entry_type:
-                if exec_price_y_open <= 0 or exec_price_x_open <= 0:
-                    logging.warning(
-                        f"{timestamp}: Precio de ejecución inválido post-slippage. Y_exec: {exec_price_y_open}, X_exec: {exec_price_x_open}. Saltando trade."
-                    )
-                    continue
+#             if entry_type:
+#                 if exec_price_y_open <= 0 or exec_price_x_open <= 0:
+#                     logging.warning(
+#                         f"{timestamp}: Precio de ejecución inválido post-slippage. Y_exec: {exec_price_y_open}, X_exec: {exec_price_x_open}. Saltando trade."
+#                     )
+#                     continue
 
-                current_qty_y = nominal_y_alloc / exec_price_y_open
-                current_qty_x = nominal_x_alloc / exec_price_x_open
+#                 current_qty_y = nominal_y_alloc / exec_price_y_open
+#                 current_qty_x = nominal_x_alloc / exec_price_x_open
 
-                slippage_cost_y_entry = (
-                    abs(exec_price_y_open - current_market_price_y_entry)
-                    * current_qty_y
-                )
-                slippage_cost_x_entry = (
-                    abs(exec_price_x_open - current_market_price_x_entry)
-                    * current_qty_x
-                )
+#                 slippage_cost_y_entry = (
+#                     abs(exec_price_y_open - current_market_price_y_entry)
+#                     * current_qty_y
+#                 )
+#                 slippage_cost_x_entry = (
+#                     abs(exec_price_x_open - current_market_price_x_entry)
+#                     * current_qty_x
+#                 )
 
-                fee_cost_y_entry = abs(
-                    exec_price_y_open * current_qty_y * TAKER_FEE_PCT
-                )
-                fee_cost_x_entry = abs(
-                    exec_price_x_open * current_qty_x * TAKER_FEE_PCT
-                )
-                total_fees_entry = fee_cost_y_entry + fee_cost_x_entry
+#                 fee_cost_y_entry = abs(
+#                     exec_price_y_open * current_qty_y * params_obj.TAKER_FEE_PCT
+#                 )
+#                 fee_cost_x_entry = abs(
+#                     exec_price_x_open * current_qty_x * params_obj.TAKER_FEE_PCT
+#                 )
+#                 total_fees_entry = fee_cost_y_entry + fee_cost_x_entry
 
-                equity -= total_fees_entry  # Equity se actualiza DESPUÉS de haber guardado current_equity_base_for_trade_and_pnl_stop
-                equity_curve[timestamp] = equity
-                trail_peak_pnl = None  # reinicia trailing para el nuevo trade
+#                 equity -= total_fees_entry  # Equity se actualiza DESPUÉS de haber guardado current_equity_base_for_trade_and_pnl_stop
+#                 equity_curve[timestamp] = equity
+#                 trail_peak_pnl = None  # reinicia trailing para el nuevo trade
 
-                current_position = entry_type
-                position_entry_market_price_y = current_market_price_y_entry
-                position_entry_market_price_x = current_market_price_x_entry
-                position_entry_exec_price_y = exec_price_y_open
-                position_entry_exec_price_x = exec_price_x_open
-                position_qty_y = current_qty_y
-                position_qty_x = current_qty_x
-                position_entry_alpha = row["alpha"]
-                position_entry_beta = beta_at_trade
-                position_entry_time = timestamp
-                position_entry_zscore_value = z_score_val
-                position_entry_spread_value = current_spread_value_at_entry
-                is_leg_x_long = current_is_leg_x_long
-                # NUEVO: Guardar variables de estado para P&L Stop
-                position_equity_base_for_pnl_stop = (
-                    current_equity_base_for_trade_and_pnl_stop
-                )
-                position_total_entry_fees = total_fees_entry
+#                 current_position = entry_type
+#                 position_entry_market_price_y = current_market_price_y_entry
+#                 position_entry_market_price_x = current_market_price_x_entry
+#                 position_entry_exec_price_y = exec_price_y_open
+#                 position_entry_exec_price_x = exec_price_x_open
+#                 position_qty_y = current_qty_y
+#                 position_qty_x = current_qty_x
+#                 position_entry_alpha = row["alpha"]
+#                 position_entry_beta = beta_at_trade
+#                 position_entry_time = timestamp
+#                 position_entry_zscore_value = z_score_val
+#                 position_entry_spread_value = current_spread_value_at_entry
+#                 is_leg_x_long = current_is_leg_x_long
+#                 # NUEVO: Guardar variables de estado para P&L Stop
+#                 position_equity_base_for_pnl_stop = (
+#                     current_equity_base_for_trade_and_pnl_stop
+#                 )
+#                 position_total_entry_fees = total_fees_entry
 
-                trades_log.append(
-                    {
-                        "entry_time": timestamp,
-                        "exit_time": None,
-                        "position_type": current_position,
-                        "entry_zscore": position_entry_zscore_value,
-                        "exit_zscore": None,
-                        "reason_entry": f"Z-Score Signal ({z_score_val:.2f})",
-                        "reason_exit": None,
-                        "asset_y": ASSET_Y_COL,
-                        "market_price_y_entry": position_entry_market_price_y,
-                        "exec_price_y_entry": position_entry_exec_price_y,
-                        "market_price_y_exit": None,
-                        "exec_price_y_exit": None,
-                        "qty_y": position_qty_y,
-                        "nominal_y_alloc": nominal_y_alloc,
-                        "pnl_y": None,
-                        "slippage_cost_y_entry": slippage_cost_y_entry,
-                        "fee_cost_y_entry": fee_cost_y_entry,
-                        "slippage_cost_y_exit": None,
-                        "fee_cost_y_exit": None,
-                        "asset_x": ASSET_X_COL,
-                        "market_price_x_entry": position_entry_market_price_x,
-                        "exec_price_x_entry": position_entry_exec_price_x,
-                        "market_price_x_exit": None,
-                        "exec_price_x_exit": None,
-                        "qty_x": position_qty_x,
-                        "nominal_x_alloc": nominal_x_alloc,
-                        "pnl_x": None,
-                        "slippage_cost_x_entry": slippage_cost_x_entry,
-                        "fee_cost_x_entry": fee_cost_x_entry,
-                        "slippage_cost_x_exit": None,
-                        "fee_cost_x_exit": None,
-                        "entry_alpha": position_entry_alpha,
-                        "entry_beta": position_entry_beta,
-                        "beta_p_value_at_entry": row["beta_p_value"],
-                        "ols_r_squared_at_entry": row["ols_r_squared"],
-                        "spread_value_at_entry": position_entry_spread_value,
-                        "spread_value_at_exit": None,
-                        "is_leg_x_long_at_entry": is_leg_x_long,
-                        "entry_fees_total": total_fees_entry,
-                        "pnl_net_after_entry_costs": -total_fees_entry,
-                        "total_fees": None,
-                        "total_pnl_gross": None,
-                        "final_trade_pnl_net": None,
-                        "equity_after_trade": None,
-                    }
-                )
-                logging.info(
-                    f"TRADE OPENED: {current_position} | Z: {z_score_val:.2f} | Beta: {beta_at_trade:.4f} "
-                    f"(pVal: {row['beta_p_value']:.4f}, R²: {row['ols_r_squared']:.4f}) | "
-                    f"Market Y: {current_market_price_y_entry:.4f}, Exec Y: {exec_price_y_open:.4f}, Qty Y: {current_qty_y:.4f}, Slip Y: {slippage_cost_y_entry:.2f}, Fee Y: {fee_cost_y_entry:.2f} | "
-                    f"Market X: {current_market_price_x_entry:.4f}, Exec X: {exec_price_x_open:.4f}, Qty X: {current_qty_x:.4f}, Slip X: {slippage_cost_x_entry:.2f}, Fee X: {fee_cost_x_entry:.2f} | "
-                    f"Nom Y: {nominal_y_alloc:.2f}, Nom X: {nominal_x_alloc:.2f} | Eq after fees: {equity:.2f}"
-                )
+#                 trades_log.append(
+#                     {
+#                         "entry_time": timestamp,
+#                         "exit_time": None,
+#                         "position_type": current_position,
+#                         "entry_zscore": position_entry_zscore_value,
+#                         "exit_zscore": None,
+#                         "reason_entry": f"Z-Score Signal ({z_score_val:.2f})",
+#                         "reason_exit": None,
+#                         "asset_y": params_obj.ASSET_Y_COL,
+#                         "market_price_y_entry": position_entry_market_price_y,
+#                         "exec_price_y_entry": position_entry_exec_price_y,
+#                         "market_price_y_exit": None,
+#                         "exec_price_y_exit": None,
+#                         "qty_y": position_qty_y,
+#                         "nominal_y_alloc": nominal_y_alloc,
+#                         "pnl_y": None,
+#                         "slippage_cost_y_entry": slippage_cost_y_entry,
+#                         "fee_cost_y_entry": fee_cost_y_entry,
+#                         "slippage_cost_y_exit": None,
+#                         "fee_cost_y_exit": None,
+#                         "asset_x": params_obj.ASSET_X_COL,
+#                         "market_price_x_entry": position_entry_market_price_x,
+#                         "exec_price_x_entry": position_entry_exec_price_x,
+#                         "market_price_x_exit": None,
+#                         "exec_price_x_exit": None,
+#                         "qty_x": position_qty_x,
+#                         "nominal_x_alloc": nominal_x_alloc,
+#                         "pnl_x": None,
+#                         "slippage_cost_x_entry": slippage_cost_x_entry,
+#                         "fee_cost_x_entry": fee_cost_x_entry,
+#                         "slippage_cost_x_exit": None,
+#                         "fee_cost_x_exit": None,
+#                         "entry_alpha": position_entry_alpha,
+#                         "entry_beta": position_entry_beta,
+#                         "beta_p_value_at_entry": row["beta_p_value"],
+#                         "ols_r_squared_at_entry": row["ols_r_squared"],
+#                         "spread_value_at_entry": position_entry_spread_value,
+#                         "spread_value_at_exit": None,
+#                         "is_leg_x_long_at_entry": is_leg_x_long,
+#                         "entry_fees_total": total_fees_entry,
+#                         "pnl_net_after_entry_costs": -total_fees_entry,
+#                         "total_fees": None,
+#                         "total_pnl_gross": None,
+#                         "final_trade_pnl_net": None,
+#                         "equity_after_trade": None,
+#                     }
+#                 )
+#                 logging.info(
+#                     f"TRADE OPENED: {current_position} | Z: {z_score_val:.2f} | Beta: {beta_at_trade:.4f} "
+#                     f"(pVal: {row['beta_p_value']:.4f}, R²: {row['ols_r_squared']:.4f}) | "
+#                     f"Market Y: {current_market_price_y_entry:.4f}, Exec Y: {exec_price_y_open:.4f}, Qty Y: {current_qty_y:.4f}, Slip Y: {slippage_cost_y_entry:.2f}, Fee Y: {fee_cost_y_entry:.2f} | "
+#                     f"Market X: {current_market_price_x_entry:.4f}, Exec X: {exec_price_x_open:.4f}, Qty X: {current_qty_x:.4f}, Slip X: {slippage_cost_x_entry:.2f}, Fee X: {fee_cost_x_entry:.2f} | "
+#                     f"Nom Y: {nominal_y_alloc:.2f}, Nom X: {nominal_x_alloc:.2f} | Eq after fees: {equity:.2f}"
+#                 )
 
-    if current_position:  # Si hay posición abierta al final del backtest
-        logging.info(
-            f"Cerrando posición abierta al final del backtest: {current_position}"
-        )
-        last_row = df.iloc[-1]
-        market_price_y_exit_final = last_row[ASSET_Y_COL]
-        market_price_x_exit_final = last_row[ASSET_X_COL]
-        spread_value_at_exit_final = last_row["spread"]
+#     if current_position:  # Si hay posición abierta al final del backtest
+#         logging.info(
+#             f"Cerrando posición abierta al final del backtest: {current_position}"
+#         )
+#         last_row = df.iloc[-1]
+#         market_price_y_exit_final = last_row[params_obj.ASSET_Y_COL]
+#         market_price_x_exit_final = last_row[params_obj.ASSET_X_COL]
+#         spread_value_at_exit_final = last_row["spread"]
 
-        if current_position == "long_spread":
-            exec_price_y_close = apply_slippage(
-                market_price_y_exit_final, "sell", SLIPPAGE_PCT
-            )
-            pnl_y = (exec_price_y_close - position_entry_exec_price_y) * position_qty_y
-        else:
-            exec_price_y_close = apply_slippage(
-                market_price_y_exit_final, "buy", SLIPPAGE_PCT
-            )
-            pnl_y = (position_entry_exec_price_y - exec_price_y_close) * position_qty_y
-        if is_leg_x_long:
-            exec_price_x_close = apply_slippage(
-                market_price_x_exit_final, "sell", SLIPPAGE_PCT
-            )
-            pnl_x = (exec_price_x_close - position_entry_exec_price_x) * position_qty_x
-        else:
-            exec_price_x_close = apply_slippage(
-                market_price_x_exit_final, "buy", SLIPPAGE_PCT
-            )
-            pnl_x = (position_entry_exec_price_x - exec_price_x_close) * position_qty_x
+#         if current_position == "long_spread":
+#             exec_price_y_close = apply_slippage(
+#                 market_price_y_exit_final, "sell", params_obj.SLIPPAGE_PCT
+#             )
+#             pnl_y = (exec_price_y_close - position_entry_exec_price_y) * position_qty_y
+#         else:
+#             exec_price_y_close = apply_slippage(
+#                 market_price_y_exit_final, "buy", params_obj.SLIPPAGE_PCT
+#             )
+#             pnl_y = (position_entry_exec_price_y - exec_price_y_close) * position_qty_y
+#         if is_leg_x_long:
+#             exec_price_x_close = apply_slippage(
+#                 market_price_x_exit_final, "sell", params_obj.SLIPPAGE_PCT
+#             )
+#             pnl_x = (exec_price_x_close - position_entry_exec_price_x) * position_qty_x
+#         else:
+#             exec_price_x_close = apply_slippage(
+#                 market_price_x_exit_final, "buy", params_obj.SLIPPAGE_PCT
+#             )
+#             pnl_x = (position_entry_exec_price_x - exec_price_x_close) * position_qty_x
 
-        slippage_cost_y_exit_final = (
-            abs(exec_price_y_close - market_price_y_exit_final) * position_qty_y
-        )
-        slippage_cost_x_exit_final = (
-            abs(exec_price_x_close - market_price_x_exit_final) * position_qty_x
-        )
-        fee_cost_y_exit_final = abs(exec_price_y_close * position_qty_y * TAKER_FEE_PCT)
-        fee_cost_x_exit_final = abs(exec_price_x_close * position_qty_x * TAKER_FEE_PCT)
-        total_fees_close_final = fee_cost_y_exit_final + fee_cost_x_exit_final
+#         slippage_cost_y_exit_final = (
+#             abs(exec_price_y_close - market_price_y_exit_final) * position_qty_y
+#         )
+#         slippage_cost_x_exit_final = (
+#             abs(exec_price_x_close - market_price_x_exit_final) * position_qty_x
+#         )
+#         fee_cost_y_exit_final = abs(exec_price_y_close * position_qty_y * params_obj.TAKER_FEE_PCT)
+#         fee_cost_x_exit_final = abs(exec_price_x_close * position_qty_x * params_obj.TAKER_FEE_PCT)
+#         total_fees_close_final = fee_cost_y_exit_final + fee_cost_x_exit_final
 
-        pnl_trade_gross = pnl_y + pnl_x
-        pnl_trade_net_exit_leg = pnl_trade_gross - total_fees_close_final
-        equity += pnl_trade_net_exit_leg
-        equity_curve[df.index[-1]] = equity
+#         pnl_trade_gross = pnl_y + pnl_x
+#         pnl_trade_net_exit_leg = pnl_trade_gross - total_fees_close_final
+#         equity += pnl_trade_net_exit_leg
+#         equity_curve[df.index[-1]] = equity
 
-        final_trade_pnl_net_calculated_eob = 0
-        updated_in_log = False
-        for i in range(len(trades_log) - 1, -1, -1):
-            if trades_log[i]["exit_time"] is None:
-                trades_log[i].update(
-                    {
-                        "exit_time": df.index[-1],
-                        "exit_zscore": last_row["z_score"],
-                        "reason_exit": "End of Backtest",
-                        "market_price_y_exit": market_price_y_exit_final,
-                        "exec_price_y_exit": exec_price_y_close,
-                        "pnl_y": pnl_y,
-                        "market_price_x_exit": market_price_x_exit_final,
-                        "exec_price_x_exit": exec_price_x_close,
-                        "pnl_x": pnl_x,
-                        "slippage_cost_y_exit": slippage_cost_y_exit_final,
-                        "slippage_cost_x_exit": slippage_cost_x_exit_final,
-                        "fee_cost_y_exit": fee_cost_y_exit_final,
-                        "fee_cost_x_exit": fee_cost_x_exit_final,
-                        "spread_value_at_exit": spread_value_at_exit_final,
-                        "total_pnl_gross": pnl_trade_gross,
-                        "total_fees": trades_log[i]["entry_fees_total"]
-                        + total_fees_close_final,
-                        "equity_after_trade": equity,
-                    }
-                )
-                trades_log[i]["final_trade_pnl_net"] = (
-                    trades_log[i]["total_pnl_gross"] - trades_log[i]["total_fees"]
-                )
-                final_trade_pnl_net_calculated_eob = trades_log[i][
-                    "final_trade_pnl_net"
-                ]
-                updated_in_log = True
-                break
-        if not updated_in_log:
-            logging.error(
-                f"Error: No se encontró trade abierto {current_position} para actualizar al final."
-            )
-        logging.info(
-            f"TRADE CLOSED (End of Data): {current_position} | PnL Net: {final_trade_pnl_net_calculated_eob:.2f} | Equity: {equity:.2f} | "
-            f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_close:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_close:.4f})"
-        )
+#         final_trade_pnl_net_calculated_eob = 0
+#         updated_in_log = False
+#         for i in range(len(trades_log) - 1, -1, -1):
+#             if trades_log[i]["exit_time"] is None:
+#                 trades_log[i].update(
+#                     {
+#                         "exit_time": df.index[-1],
+#                         "exit_zscore": last_row["z_score"],
+#                         "reason_exit": "End of Backtest",
+#                         "market_price_y_exit": market_price_y_exit_final,
+#                         "exec_price_y_exit": exec_price_y_close,
+#                         "pnl_y": pnl_y,
+#                         "market_price_x_exit": market_price_x_exit_final,
+#                         "exec_price_x_exit": exec_price_x_close,
+#                         "pnl_x": pnl_x,
+#                         "slippage_cost_y_exit": slippage_cost_y_exit_final,
+#                         "slippage_cost_x_exit": slippage_cost_x_exit_final,
+#                         "fee_cost_y_exit": fee_cost_y_exit_final,
+#                         "fee_cost_x_exit": fee_cost_x_exit_final,
+#                         "spread_value_at_exit": spread_value_at_exit_final,
+#                         "total_pnl_gross": pnl_trade_gross,
+#                         "total_fees": trades_log[i]["entry_fees_total"]
+#                         + total_fees_close_final,
+#                         "equity_after_trade": equity,
+#                     }
+#                 )
+#                 trades_log[i]["final_trade_pnl_net"] = (
+#                     trades_log[i]["total_pnl_gross"] - trades_log[i]["total_fees"]
+#                 )
+#                 final_trade_pnl_net_calculated_eob = trades_log[i][
+#                     "final_trade_pnl_net"
+#                 ]
+#                 updated_in_log = True
+#                 break
+#         if not updated_in_log:
+#             logging.error(
+#                 f"Error: No se encontró trade abierto {current_position} para actualizar al final."
+#             )
+#         logging.info(
+#             f"TRADE CLOSED (End of Data): {current_position} | PnL Net: {final_trade_pnl_net_calculated_eob:.2f} | Equity: {equity:.2f} | "
+#             f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_close:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_close:.4f})"
+#         )
 
-    logging.info("Backtest finalizado.")
-    return df, equity_curve.dropna(), pd.DataFrame(trades_log)
+#     logging.info("Backtest finalizado.")
+#     return df, equity_curve.dropna(), pd.DataFrame(trades_log)
 
 
 # --- Métricas y Gráficos ---
+# calculate_performance_metrics already takes initial_capital and risk_free_rate_annual as arguments
+# So no change needed to its signature or internal use of these particular params.
 def calculate_performance_metrics(
     equity_curve, trades_df, initial_capital, risk_free_rate_annual
 ):
@@ -965,17 +1640,17 @@ def calculate_performance_metrics(
     sortino_ratio = 0
     if not daily_returns.empty and daily_returns.std() != 0:
         rf_daily = (1 + risk_free_rate_annual) ** (
-            1 / 252
-        ) - 1  # Assuming 252 trading days
+            1 / TRADING_DAYS_PER_YEAR
+        ) - 1
         sharpe_ratio = (
-            (daily_returns.mean() - rf_daily) / daily_returns.std() * np.sqrt(252)
+            (daily_returns.mean() - rf_daily) / daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
         )
         negative_returns = daily_returns[daily_returns < 0]
         if not negative_returns.empty and negative_returns.std() != 0:
             sortino_ratio = (
                 (daily_returns.mean() - rf_daily)
                 / negative_returns.std()
-                * np.sqrt(252)
+                * np.sqrt(TRADING_DAYS_PER_YEAR)
             )
     calmar_ratio = cagr / abs(max_drawdown) if max_drawdown != 0 else 0
     num_trades = len(trades_df) if trades_df is not None else 0
@@ -1043,7 +1718,7 @@ def calculate_performance_metrics(
     return metrics
 
 
-def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
+def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir, params_obj: StrategyParameters):
     if equity_curve is None or equity_curve.empty:
         logging.warning("Equity curve vacía. No se pueden generar gráficos.")
         return
@@ -1092,26 +1767,26 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
             linewidth=1.5,
         )
         ax.axhline(
-            ENTRY_ZSCORE,
+            params_obj.ENTRY_ZSCORE,
             color="gray",
             linestyle="--",
-            label=f"Entry Z={ENTRY_ZSCORE:.2f}",
+            label=f"Entry Z={params_obj.ENTRY_ZSCORE:.2f}",
         )
-        ax.axhline(-ENTRY_ZSCORE, color="gray", linestyle="--")
+        ax.axhline(-params_obj.ENTRY_ZSCORE, color="gray", linestyle="--")
         ax.axhline(
-            EXIT_ZSCORE,
+            params_obj.EXIT_ZSCORE,
             color="silver",
             linestyle=":",
-            label=f"Exit Z={EXIT_ZSCORE:.2f}",
+            label=f"Exit Z={params_obj.EXIT_ZSCORE:.2f}",
         )
-        ax.axhline(-EXIT_ZSCORE, color="silver", linestyle=":")
+        ax.axhline(-params_obj.EXIT_ZSCORE, color="silver", linestyle=":")
         ax.axhline(
-            STOP_LOSS_ZSCORE,
+            params_obj.STOP_LOSS_ZSCORE,
             color="black",
             linestyle="-.",
-            label=f"Stop Loss Z={STOP_LOSS_ZSCORE:.1f}",
+            label=f"Stop Loss Z={params_obj.STOP_LOSS_ZSCORE:.1f}",
         )
-        ax.axhline(-STOP_LOSS_ZSCORE, color="black", linestyle="-.")
+        ax.axhline(-params_obj.STOP_LOSS_ZSCORE, color="black", linestyle="-.")
 
         if trades_df is not None and not trades_df.empty:
             trades_df_copy = trades_df.copy()
@@ -1213,8 +1888,8 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
                             edgecolors="black",
                         )
         # --- OLS filter shading ---
-        condition_beta_pval = df_plot["beta_p_value"] >= BETA_P_VALUE_THRESHOLD
-        condition_r_squared = df_plot["ols_r_squared"] < MIN_OLS_R_SQUARED_THRESHOLD
+        condition_beta_pval = df_plot["beta_p_value"] >= params_obj.BETA_P_VALUE_THRESHOLD
+        condition_r_squared = df_plot["ols_r_squared"] < params_obj.MIN_OLS_R_SQUARED_THRESHOLD
         filter_active = condition_beta_pval | condition_r_squared
         if filter_active.any():
             y_min, y_max = ax.get_ylim()
@@ -1227,8 +1902,8 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
                 alpha=0.3,
                 label=(
                     f"Filtro OLS activo "
-                    f"(pVal>{BETA_P_VALUE_THRESHOLD:.2f} "
-                    f"o R²<{MIN_OLS_R_SQUARED_THRESHOLD:.2f})"
+                    f"(pVal>{params_obj.BETA_P_VALUE_THRESHOLD:.2f} "
+                    f"o R²<{params_obj.MIN_OLS_R_SQUARED_THRESHOLD:.2f})"
                 ),
             )
         ax.set_title("Spread Z-Score con Señales de Trading", fontsize=16)
@@ -1280,16 +1955,27 @@ def run_walkforward_backtest(df_input, train_days: int, test_days: int, **params
         if df_slice.empty:
             break
 
+        current_params_dict = dict(params) # Make a mutable copy of incoming params
+
         # Use the equity at the splice point as fresh initial capital.
-        slice_initial = (
+        slice_initial_capital = (
             overall_equity.iloc[-1]
             if not overall_equity.empty
-            else params.get("INITIAL_CAPITAL", INITIAL_CAPITAL)
+            # Fallback to default if not in params (e.g. if called directly not from gridsearch)
+            else current_params_dict.get("INITIAL_CAPITAL", StrategyParameters().INITIAL_CAPITAL)
         )
-        params_slice = dict(params)
-        params_slice["INITIAL_CAPITAL"] = slice_initial
+        current_params_dict["INITIAL_CAPITAL"] = slice_initial_capital
 
-        _, slice_equity, slice_trades = run_backtest(df_slice, **params_slice)
+        # Instantiate StrategyParameters object for this slice
+        slice_params_obj = StrategyParameters(**current_params_dict)
+
+        # Create a PairTradingBacktester instance with these specific params for the slice
+        backtester_slice = PairTradingBacktester(params=slice_params_obj)
+
+        # Call the run method on this instance
+        # run() returns: df_processed, equity_curve, trades_summary_df
+        # We only need the equity_curve and trades_summary_df for walk-forward
+        _, slice_equity, slice_trades = backtester_slice.run(df_slice)
 
         if slice_equity is None or slice_equity.empty:
             cursor = train_end  # advance anyway
@@ -1314,7 +2000,8 @@ def run_walkforward_backtest(df_input, train_days: int, test_days: int, **params
 if __name__ == "__main__":
     logging.info("--- INICIO DEL SCRIPT DE BACKTESTING ---")
     params = StrategyParameters()
-    df_original = load_data(DATA_FILEPATH, params)
+    # Load data using the filepath from the params object
+    df_original = load_data(params.DATA_FILEPATH, params)
     if df_original is not None and not df_original.empty:
         # Usar OOP wrapper PairTradingBacktester
         backtester = PairTradingBacktester(params)
@@ -1346,18 +2033,18 @@ if __name__ == "__main__":
                 metrics = calculate_performance_metrics(
                     equity_curve,
                     trades_df_for_metrics,
-                    INITIAL_CAPITAL,
-                    RISK_FREE_RATE_ANNUAL,
+                    params.INITIAL_CAPITAL, # Use params object
+                    params.RISK_FREE_RATE_ANNUAL, # Use params object
                 )
                 plot_results(
-                    df_processed, equity_curve, trades_df_for_metrics, PLOT_DIR
+                    df_processed, equity_curve, trades_df_for_metrics, PLOT_DIR, params # Pass params object
                 )
             else:
                 logging.warning(
                     "No se generaron trades para guardar en CSV o calcular métricas."
                 )
                 # Aún así, intentar graficar la curva de equity si existe
-                plot_results(df_processed, equity_curve, pd.DataFrame(), PLOT_DIR)
+                plot_results(df_processed, equity_curve, pd.DataFrame(), PLOT_DIR, params) # Pass params object
 
         else:
             logging.error("El backtest no produjo una curva de equity válida.")

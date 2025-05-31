@@ -1,6 +1,7 @@
 # gridsearch.py
 import itertools, json, pandas as pd
 import os
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # Define BASE_DIR
 from pathlib import Path
 import sys, pathlib
 from dataclasses import asdict
@@ -21,9 +22,10 @@ from backtesting import (
     StrategyParameters,
 )
 
-DATA_FILE = Path("/Users/elgask0/REPOS/algo_meme/data/spread_data.csv")
-params = StrategyParameters()
-df = load_data(DATA_FILE, params)
+# Use default_params for initial setup and as base for grid search iterations
+default_params = StrategyParameters()
+# Load data using the filepath from the default_params object
+df = load_data(default_params.DATA_FILEPATH, default_params)
 
 # Ajuste dinámico del walk-forward según tamaño de datos (~5-min freq)
 # Determinar frecuencia en minutos; si no está definido, asumir 5
@@ -56,12 +58,12 @@ param_grid = {
     "TRAIL_STOP_PCT": [1.0],
     "SL_COOLDOWN_HOURS": [8]
 }
-default_params = StrategyParameters()
+# default_params is already defined above
 grid_keys = list(param_grid.keys())
 total_combos = math.prod(len(param_grid[key]) for key in grid_keys)
 
 results = []
-OUTPUT_FILE = "gridsearch_results.csv"
+OUTPUT_FILE = os.path.join(BASE_DIR, "gridsearch_results.csv") # Update OUTPUT_FILE
 # If we are starting a fresh run, remove any prior partial file so the header is written cleanly.
 if os.path.exists(OUTPUT_FILE):
     os.remove(OUTPUT_FILE)
