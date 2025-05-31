@@ -5,12 +5,13 @@ from statsmodels.regression.rolling import RollingOLS
 import matplotlib.pyplot as plt
 import logging
 import os
+import sqlite3
 from datetime import timedelta
 from dataclasses import dataclass, asdict
 from typing import Optional
 
 # --- Configuración General ---
-DATA_FILEPATH = "/Users/elgask0/REPOS/algo_meme/data/spread_data.csv"
+DATA_FILEPATH = "/Users/elgask0/REPOS/algo_meme/trading_data.db"
 LOG_DIR = "/Users/elgask0/REPOS/algo_meme/logs"
 PLOT_DIR = "/Users/elgask0/REPOS/algo_meme/plots"
 LOG_FILE = os.path.join(LOG_DIR, "backtest_run.log")
@@ -98,47 +99,69 @@ class PairTradingBacktester:
         return run_backtest(df_input, **param_dict)
 
 
-# --- Funciones Auxiliares ---
 def load_data(filepath, params: StrategyParameters):
-    logging.info(f"Cargando datos desde: {filepath}")
+    logging.info(f"Cargando datos desde BDD: {filepath}")
     try:
-        df = pd.read_csv(filepath)
-        df["ts_start"] = pd.to_datetime(df["ts_start"])
-        df.set_index("ts_start", inplace=True)
+        conn = sqlite3.connect(filepath)
+        # --- Obtener precios de mark_price_vwap para ambos símbolos ---
+        query_mark = f"""
+            SELECT ts_start, symbol_id, mark_price
+            FROM mark_price_vwap
+            WHERE symbol_id IN ('{params.ASSET_Y_COL}', '{params.ASSET_X_COL}')
+        """
+        df_mark = pd.read_sql_query(query_mark, conn, parse_dates=['ts_start'])
+        if df_mark.empty:
+            logging.error("No hay datos de precios en mark_price_vwap para los activos.")
+            conn.close()
+            return None
+        # Pivotar para tener columnas separadas para cada símbolo
+        df_mark_pivot = df_mark.pivot(index='ts_start', columns='symbol_id', values='mark_price')
+        # Renombrar columnas para que coincidan con ASSET_Y_COL y ASSET_X_COL
+        df = df_mark_pivot.rename(columns={
+            params.ASSET_Y_COL: params.ASSET_Y_COL,
+            params.ASSET_X_COL: params.ASSET_X_COL
+        })
+
+        # --- Obtener funding rates históricos para ambos símbolos ---
+        query_funding = f"""
+            SELECT ts AS ts, symbol, funding_rate
+            FROM mexc_funding_rate_history
+            WHERE symbol IN ('{params.ASSET_Y_COL}', '{params.ASSET_X_COL}')
+        """
+        df_funding = pd.read_sql_query(query_funding, conn, parse_dates=['ts'])
+        conn.close()
+
+        df_funding_y = (
+            df_funding[df_funding['symbol'] == params.ASSET_Y_COL]
+            .set_index('ts')[['funding_rate']]
+            .rename(columns={'funding_rate': 'funding_rate_y'})
+        )
+        df_funding_x = (
+            df_funding[df_funding['symbol'] == params.ASSET_X_COL]
+            .set_index('ts')[['funding_rate']]
+            .rename(columns={'funding_rate': 'funding_rate_x'})
+        )
+
+        # Unir las funding rates y rellenar con 0 donde falten datos
+        df = (
+            df.join(df_funding_y, how="left")
+              .join(df_funding_x, how="left")
+              .fillna({"funding_rate_y": 0.0, "funding_rate_x": 0.0})
+        )
         df.sort_index(inplace=True)
+
+        # Eliminar filas sin datos de precio
         df.dropna(subset=[params.ASSET_Y_COL, params.ASSET_X_COL], inplace=True)
         if df.empty:
             logging.error("No hay datos después de eliminar NaNs iniciales.")
             return None
+
         logging.info(
-            f"Datos cargados. Rango original: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
+            f"Datos cargados. Rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
         )
-        # --- Añadir funding rates ---
-        try:
-            fr = pd.read_csv(FUNDING_FILEPATH, parse_dates=["ts"])
-            fr.set_index("ts", inplace=True)
-            fr_y = fr[fr["symbol"] == params.ASSET_Y_COL][["funding_rate"]].rename(
-                columns={"funding_rate": "funding_rate_y"}
-            )
-            fr_x = fr[fr["symbol"] == params.ASSET_X_COL][["funding_rate"]].rename(
-                columns={"funding_rate": "funding_rate_x"}
-            )
-            # Unir, rellenar con 0 si falta dato
-            df = (
-                df.join(fr_y, how="left")
-                .join(fr_x, how="left")
-                .fillna({"funding_rate_y": 0.0, "funding_rate_x": 0.0})
-            )
-        except FileNotFoundError:
-            logging.warning("Archivo de funding no encontrado, se ignora.")
-        except Exception as e_f:
-            logging.warning(f"Error leyendo funding: {e_f}")
         return df
-    except FileNotFoundError:
-        logging.error(f"Archivo de datos no encontrado: {filepath}")
-        return None
-    except Exception as e:
-        logging.error(f"Error cargando datos: {e}")
+    except sqlite3.Error as e:
+        logging.error(f"Error cargando datos desde BDD: {e}")
         return None
 
 
