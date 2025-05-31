@@ -10,7 +10,7 @@ from datetime import timedelta
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-# --- Configuración General ---
+# --- General Configuration ---
 DATA_FILEPATH = "/Users/elgask0/REPOS/algo_meme/trading_data.db"
 LOG_DIR = "/Users/elgask0/REPOS/algo_meme/logs"
 PLOT_DIR = "/Users/elgask0/REPOS/algo_meme/plots"
@@ -100,10 +100,10 @@ class PairTradingBacktester:
 
 
 def load_data(filepath, params: StrategyParameters):
-    logging.info(f"Cargando datos desde BDD: {filepath}")
+    logging.info(f"Loading data from DB: {filepath}")
     try:
         conn = sqlite3.connect(filepath)
-        # --- Obtener precios de mark_price_vwap para ambos símbolos ---
+        # --- Get mark_price_vwap prices for both symbols ---
         query_mark = f"""
             SELECT ts_start, symbol_id, mark_price
             FROM mark_price_vwap
@@ -111,18 +111,18 @@ def load_data(filepath, params: StrategyParameters):
         """
         df_mark = pd.read_sql_query(query_mark, conn, parse_dates=['ts_start'])
         if df_mark.empty:
-            logging.error("No hay datos de precios en mark_price_vwap para los activos.")
+            logging.error("No price data available in mark_price_vwap for the assets.")
             conn.close()
             return None
-        # Pivotar para tener columnas separadas para cada símbolo
+        # Pivot to have separate columns for each symbol
         df_mark_pivot = df_mark.pivot(index='ts_start', columns='symbol_id', values='mark_price')
-        # Renombrar columnas para que coincidan con ASSET_Y_COL y ASSET_X_COL
+        # Rename columns to match ASSET_Y_COL and ASSET_X_COL
         df = df_mark_pivot.rename(columns={
             params.ASSET_Y_COL: params.ASSET_Y_COL,
             params.ASSET_X_COL: params.ASSET_X_COL
         })
 
-        # --- Obtener funding rates históricos para ambos símbolos ---
+        # --- Get historical funding rates for both symbols ---
         query_funding = f"""
             SELECT ts AS ts, symbol, funding_rate
             FROM mexc_funding_rate_history
@@ -142,7 +142,7 @@ def load_data(filepath, params: StrategyParameters):
             .rename(columns={'funding_rate': 'funding_rate_x'})
         )
 
-        # Unir las funding rates y rellenar con 0 donde falten datos
+        # Join funding rates and fill with 0 where data is missing
         df = (
             df.join(df_funding_y, how="left")
               .join(df_funding_x, how="left")
@@ -150,18 +150,18 @@ def load_data(filepath, params: StrategyParameters):
         )
         df.sort_index(inplace=True)
 
-        # Eliminar filas sin datos de precio
+        # Remove rows without price data
         df.dropna(subset=[params.ASSET_Y_COL, params.ASSET_X_COL], inplace=True)
         if df.empty:
-            logging.error("No hay datos después de eliminar NaNs iniciales.")
+            logging.error("No data after removing initial NaNs.")
             return None
 
         logging.info(
-            f"Datos cargados. Rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
+            f"Data loaded. Range: {df.index.min()} to {df.index.max()}. Rows: {len(df)}"
         )
         return df
     except sqlite3.Error as e:
-        logging.error(f"Error cargando datos desde BDD: {e}")
+        logging.error(f"Error loading data from DB: {e}")
         return None
 
 
@@ -226,7 +226,7 @@ def calculate_rolling_ols_and_spread(df, asset_y_col, asset_x_col, window_period
 
 def calculate_zscore(series, window_periods):
     if window_periods < 1:
-        logging.error(f"Z-score window_periods es {window_periods}, debe ser >= 1.")
+        logging.error(f"Z-score window_periods is {window_periods}, must be >= 1.")
         return pd.Series(np.nan, index=series.index)
     mean = series.rolling(window=window_periods, min_periods=window_periods).mean()
     std = series.rolling(window=window_periods, min_periods=window_periods).std()
@@ -242,53 +242,53 @@ def apply_slippage(price, side, slippage_pct):
     return price
 
 
-# --- Lógica Principal del Backtest ---
+# --- Main Backtest Logic ---
 def run_backtest(df_input, **params):
     # Allow external scripts to override any constant simply by passing
     # keyword arguments, e.g. run_backtest(df, ENTRY_ZSCORE=2.0).
     # The override is done once per call so a grid‑search can explore many
     # combinations safely.
     globals().update(params)
-    logging.info("Iniciando backtest...")
+    logging.info("Starting backtest...")
     # --- Log strategy parameters for traceability ---
     try:
         # Gather all fields from StrategyParameters dataclass
         param_keys = list(StrategyParameters.__annotations__.keys())
         current_params = {key: globals().get(key) for key in param_keys}
-        logging.info(f"Estrategia parámetros: {current_params}")
+        logging.info(f"Strategy parameters: {current_params}")
     except Exception as e:
-        logging.warning(f"No se pudieron registrar los parámetros de estrategia: {e}")
+        logging.warning(f"Could not log strategy parameters: {e}")
     df = df_input.copy()
 
     current_data_freq_minutes = DEFAULT_DATA_FREQ_MINUTES
     if RESAMPLE_ALL_DATA_TO_MINUTES is not None and RESAMPLE_ALL_DATA_TO_MINUTES > 0:
         logging.info(
-            f"Resampleando todos los datos a velas de {RESAMPLE_ALL_DATA_TO_MINUTES} minutos."
+            f"Resampling all data to {RESAMPLE_ALL_DATA_TO_MINUTES} minute candles."
         )
         df = df.resample(f"{RESAMPLE_ALL_DATA_TO_MINUTES}min").last()
         df.dropna(subset=[ASSET_Y_COL, ASSET_X_COL], inplace=True)
         if df.empty:
-            logging.error("No hay datos después del resampleo general.")
+            logging.error("No data after general resampling.")
             return df, None, None
         current_data_freq_minutes = RESAMPLE_ALL_DATA_TO_MINUTES
         logging.info(
-            f"Datos resampleados. Nuevo rango: {df.index.min()} a {df.index.max()}. Filas: {len(df)}"
+            f"Data resampled. New range: {df.index.min()} to {df.index.max()}. Rows: {len(df)}"
         )
 
     if current_data_freq_minutes <= 0:
-        logging.error(f"Frecuencia de datos ({current_data_freq_minutes}) inválida.")
+        logging.error(f"Invalid data frequency ({current_data_freq_minutes}).")
         return df, None, None
 
     periods_in_day = (24 * 60) / current_data_freq_minutes
     ols_window_periods = int(OLS_WINDOW_DAYS * periods_in_day)
     zscore_window_periods = int(ZSCORE_WINDOW_DAYS * periods_in_day)
 
-    logging.info(f"Frecuencia de datos para cálculos: {current_data_freq_minutes} min.")
+    logging.info(f"Data frequency for calculations: {current_data_freq_minutes} min.")
     logging.info(
-        f"Ventana OLS: {OLS_WINDOW_DAYS} días = {ols_window_periods} periodos."
+        f"OLS Window: {OLS_WINDOW_DAYS} days = {ols_window_periods} periods."
     )
     logging.info(
-        f"Ventana Z-Score: {ZSCORE_WINDOW_DAYS} días = {zscore_window_periods} periodos."
+        f"Z-Score Window: {ZSCORE_WINDOW_DAYS} days = {zscore_window_periods} periods."
     )
 
     df = calculate_rolling_ols_and_spread(
@@ -302,7 +302,7 @@ def run_backtest(df_input, **params):
     )
     if df.empty:
         logging.error(
-            "No hay datos válidos después de calcular OLS (incl. p-value y R² de beta) y Z-score."
+            "No valid data after calculating OLS (including beta p-value and R²) and Z-score."
         )
         return df, None, None
 
@@ -323,9 +323,9 @@ def run_backtest(df_input, **params):
     position_entry_zscore_value = None
     position_entry_spread_value = None
     is_leg_x_long = None
-    position_equity_base_for_pnl_stop = None  # NUEVO: Equity base para P&L Stop
-    position_total_entry_fees = None  # NUEVO: Comisiones de entrada del trade actual
-    trail_peak_pnl = None  # máx. PnL neto observado para trailing‑stop
+    position_equity_base_for_pnl_stop = None  # NEW: Equity base for P&L Stop
+    position_total_entry_fees = None  # NEW: Entry fees for the current trade
+    trail_peak_pnl = None  # max net PnL observed for trailing-stop
 
     sl_cooldown_until = None
     z_signal_active = False  # Flag to avoid repeated skip logs for the same signal
@@ -386,7 +386,7 @@ def run_backtest(df_input, **params):
             )
             continue
         elif sl_cooldown_until and timestamp >= sl_cooldown_until:
-            logging.debug(f"{timestamp}: Cooldown por SL finalizado.")
+            logging.debug(f"{timestamp}: SL cooldown finished.")
             sl_cooldown_until = None
 
         if (
@@ -398,12 +398,12 @@ def run_backtest(df_input, **params):
         ):
             continue
 
-        # --- GESTIÓN DE POSICIONES ABIERTAS ---
+        # --- OPEN POSITION MANAGEMENT ---
         if current_position:
             exit_signal = False
             exit_reason = None
 
-            # --- INICIO: NUEVO Stop-Loss por P&L ---
+            # --- START: NEW P&L Stop-Loss ---
             if (
                 PNL_STOP_LOSS_PCT > 0
                 and position_equity_base_for_pnl_stop is not None
@@ -418,7 +418,7 @@ def run_backtest(df_input, **params):
                     current_market_price_x_float
                 ):
                     logging.warning(
-                        f"{timestamp}: Precio de mercado NaN para P&L flotante. Y: {current_market_price_y_float}, X: {current_market_price_x_float}. Saltando P&L Stop check esta barra."
+                        f"{timestamp}: Market price NaN for floating P&L. Y: {current_market_price_y_float}, X: {current_market_price_x_float}. Skipping P&L Stop check this bar."
                     )
                 else:
                     if current_position == "long_spread":
@@ -461,10 +461,10 @@ def run_backtest(df_input, **params):
                             hours=SL_COOLDOWN_HOURS
                         )
                         logging.warning(
-                            f"{timestamp}: P&L Stop Loss activado para {current_position}. PnL Flotante Neto: {floating_pnl_net_after_entry_costs:.2f}. Cooldown hasta {sl_cooldown_until}"
+                            f"{timestamp}: P&L Stop Loss activated for {current_position}. Net Floating PnL: {floating_pnl_net_after_entry_costs:.2f}. Cooldown until {sl_cooldown_until}"
                         )
 
-                    # --- Trailing‑stop check ---
+                    # --- Trailing-stop check ---
                     if floating_pnl_net_after_entry_costs > 0:
                         if (
                             trail_peak_pnl is None
@@ -483,12 +483,12 @@ def run_backtest(df_input, **params):
                                 hours=SL_COOLDOWN_HOURS
                             )
                             logging.warning(
-                                f"{timestamp}: Trailing‑stop activado. Cooldown hasta {sl_cooldown_until}"
+                                f"{timestamp}: Trailing-stop activated. Cooldown until {sl_cooldown_until}"
                             )
                     # -----------------------------------------------------------
-            # --- FIN: NUEVO Stop-Loss por P&L ---
+            # --- END: NEW P&L Stop-Loss ---
 
-            if not exit_signal:  # Solo comprobar Z-Score si P&L Stop no se activó
+            if not exit_signal:  # Only check Z-Score if P&L Stop was not activated
                 if (
                     current_position == "long_spread" and z_score_val >= -EXIT_ZSCORE
                 ) or (
@@ -504,10 +504,10 @@ def run_backtest(df_input, **params):
                     and z_score_val >= STOP_LOSS_ZSCORE
                 ):
                     exit_signal = True
-                    exit_reason = f"Z-Score SL ({z_score_val:.2f})"  # Modificado
+                    exit_reason = f"Z-Score SL ({z_score_val:.2f})"  # Modified
                     sl_cooldown_until = timestamp + timedelta(hours=SL_COOLDOWN_HOURS)
                     logging.warning(
-                        f"{timestamp}: Z-Score Stop Loss activado. Cooldown hasta {sl_cooldown_until}"
+                        f"{timestamp}: Z-Score Stop Loss activated. Cooldown until {sl_cooldown_until}"
                     )
 
             if exit_signal:
@@ -606,7 +606,7 @@ def run_backtest(df_input, **params):
                         break
                 if not updated_in_log:
                     logging.error(
-                        f"Error: No se encontró trade abierto {current_position} para actualizar en {timestamp}"
+                        f"Error: No open trade {current_position} found to update at {timestamp}"
                     )
 
                 logging.info(
@@ -623,16 +623,16 @@ def run_backtest(df_input, **params):
 
                 current_position = None
                 is_leg_x_long = None
-                position_equity_base_for_pnl_stop = None  # Resetear
-                position_total_entry_fees = None  # Resetear
+                position_equity_base_for_pnl_stop = None  # Reset
+                position_total_entry_fees = None  # Reset
                 trail_peak_pnl = None
 
                 if (
                     "SL" in exit_reason or "Stop Loss" in exit_reason
-                ):  # Modificado para cubrir ambos tipos de stop
+                ):  # Modified to cover both stop types
                     continue
 
-        # --- LÓGICA DE APERTURA DE POSICIÓN ---
+        # --- POSITION OPENING LOGIC ---
         if not current_position:
             # Skip if still in cooldown
             if sl_cooldown_until and timestamp < sl_cooldown_until:
@@ -666,7 +666,7 @@ def run_backtest(df_input, **params):
                 )
                 continue
 
-            # NUEVO: Guardar equity base para P&L stop y tamaño del trade
+            # NEW: Save equity base for P&L stop and trade size
             current_equity_base_for_trade_and_pnl_stop = equity
 
             trade_nominal_total = (
@@ -676,7 +676,7 @@ def run_backtest(df_input, **params):
             beta_abs = abs(beta_at_trade)
             if (1 + beta_abs) == 0:
                 logging.warning(
-                    f"{timestamp}: beta_abs es tal que (1+beta_abs) es cero. Beta: {beta_at_trade}. Saltando trade."
+                    f"{timestamp}: beta_abs is such that (1+beta_abs) is zero. Beta: {beta_at_trade}. Skipping trade."
                 )
                 continue
             nominal_y_alloc = trade_nominal_total / (1 + beta_abs)
@@ -701,7 +701,7 @@ def run_backtest(df_input, **params):
                 or current_market_price_x_entry <= 0
             ):
                 logging.warning(
-                    f"{timestamp}: Precio inválido para Y o X. Y: {current_market_price_y_entry}, X: {current_market_price_x_entry}. Saltando trade."
+                    f"{timestamp}: Invalid price for Y or X. Y: {current_market_price_y_entry}, X: {current_market_price_x_entry}. Skipping trade."
                 )
                 continue
 
@@ -741,7 +741,7 @@ def run_backtest(df_input, **params):
             if entry_type:
                 if exec_price_y_open <= 0 or exec_price_x_open <= 0:
                     logging.warning(
-                        f"{timestamp}: Precio de ejecución inválido post-slippage. Y_exec: {exec_price_y_open}, X_exec: {exec_price_x_open}. Saltando trade."
+                        f"{timestamp}: Invalid execution price post-slippage. Y_exec: {exec_price_y_open}, X_exec: {exec_price_x_open}. Skipping trade."
                     )
                     continue
 
@@ -765,9 +765,9 @@ def run_backtest(df_input, **params):
                 )
                 total_fees_entry = fee_cost_y_entry + fee_cost_x_entry
 
-                equity -= total_fees_entry  # Equity se actualiza DESPUÉS de haber guardado current_equity_base_for_trade_and_pnl_stop
+                equity -= total_fees_entry  # Equity is updated AFTER saving current_equity_base_for_trade_and_pnl_stop
                 equity_curve[timestamp] = equity
-                trail_peak_pnl = None  # reinicia trailing para el nuevo trade
+                trail_peak_pnl = None  # reset trailing for the new trade
 
                 current_position = entry_type
                 position_entry_market_price_y = current_market_price_y_entry
@@ -782,7 +782,7 @@ def run_backtest(df_input, **params):
                 position_entry_zscore_value = z_score_val
                 position_entry_spread_value = current_spread_value_at_entry
                 is_leg_x_long = current_is_leg_x_long
-                # NUEVO: Guardar variables de estado para P&L Stop
+                # NEW: Save state variables for P&L Stop
                 position_equity_base_for_pnl_stop = (
                     current_equity_base_for_trade_and_pnl_stop
                 )
@@ -844,9 +844,9 @@ def run_backtest(df_input, **params):
                     f"Nom Y: {nominal_y_alloc:.2f}, Nom X: {nominal_x_alloc:.2f} | Eq after fees: {equity:.2f}"
                 )
 
-    if current_position:  # Si hay posición abierta al final del backtest
+    if current_position:  # If there is an open position at the end of the backtest
         logging.info(
-            f"Cerrando posición abierta al final del backtest: {current_position}"
+            f"Closing open position at the end of the backtest: {current_position}"
         )
         last_row = df.iloc[-1]
         market_price_y_exit_final = last_row[ASSET_Y_COL]
@@ -925,23 +925,23 @@ def run_backtest(df_input, **params):
                 break
         if not updated_in_log:
             logging.error(
-                f"Error: No se encontró trade abierto {current_position} para actualizar al final."
+                f"Error: No open trade {current_position} found to update at the end."
             )
         logging.info(
             f"TRADE CLOSED (End of Data): {current_position} | PnL Net: {final_trade_pnl_net_calculated_eob:.2f} | Equity: {equity:.2f} | "
             f"PnL Y: {pnl_y:.2f} (Exec Px: {exec_price_y_close:.4f}), PnL X: {pnl_x:.2f} (Exec Px: {exec_price_x_close:.4f})"
         )
 
-    logging.info("Backtest finalizado.")
+    logging.info("Backtest finished.")
     return df, equity_curve.dropna(), pd.DataFrame(trades_log)
 
 
-# --- Métricas y Gráficos ---
+# --- Metrics and Plots ---
 def calculate_performance_metrics(
     equity_curve, trades_df, initial_capital, risk_free_rate_annual
 ):
     if equity_curve is None or equity_curve.empty:
-        logging.warning("Equity curve vacía. No se pueden calcular métricas.")
+        logging.warning("Empty equity curve. Cannot calculate metrics.")
         return {}
     final_equity = equity_curve.iloc[-1]
     total_return = (final_equity / initial_capital) - 1
@@ -1033,7 +1033,7 @@ def calculate_performance_metrics(
             else 0
         ),
     }
-    logging.info("--- Resumen de Métricas ---")
+    logging.info("--- Metrics Summary ---")
     for key, value in metrics.items():
         logging.info(
             f"{key}: {value:.2f}"
@@ -1045,7 +1045,7 @@ def calculate_performance_metrics(
 
 def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
     if equity_curve is None or equity_curve.empty:
-        logging.warning("Equity curve vacía. No se pueden generar gráficos.")
+        logging.warning("Empty equity curve. Cannot generate plots.")
         return
 
     plt.style.use("seaborn-v0_8-darkgrid")
@@ -1063,10 +1063,10 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
 
     if df_with_indicators is None or df_with_indicators.empty:
         logging.warning(
-            "DataFrame con indicadores vacío. No se pueden generar gráficos de spread/z-score."
+            "DataFrame with indicators is empty. Cannot generate spread/z-score plots."
         )
         return
-    logging.info(f"Guardando gráficos en: {plot_dir}")
+    logging.info(f"Saving plots to: {plot_dir}")
 
     df_plot = df_with_indicators.loc[
         df_with_indicators.index.isin(equity_curve.index)
@@ -1077,11 +1077,11 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
         )  # Fallback to all data if equity curve has different timestamps
     elif df_plot.empty and df_with_indicators.empty:
         logging.warning(
-            "df_plot está vacío, no se pueden generar gráficos de spread/z-score."
+            "df_plot is empty, cannot generate spread/z_score plots."
         )
         return
 
-    # 2. Spread Z-Score con Trades (now uses ax from combined figure)
+    # 2. Spread Z-Score with Trades (now uses ax from combined figure)
     if "z_score" in df_plot.columns:
         ax.plot(
             df_plot.index,
@@ -1128,7 +1128,7 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
                     )
                 except:
                     logging.error(
-                        "Error convirtiendo entry_time a datetime para plotting."
+                        "Error converting entry_time to datetime for plotting."
                     )
 
             valid_trades = (
@@ -1191,7 +1191,7 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
                             )
                         except:
                             logging.error(
-                                "Error convirtiendo exit_time a datetime para plotting."
+                                "Error converting exit_time to datetime for plotting."
                             )
 
                     valid_exit_times_in_plot = (
@@ -1226,12 +1226,12 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
                 color="lightcoral",
                 alpha=0.3,
                 label=(
-                    f"Filtro OLS activo "
+                    f"OLS Filter Active "
                     f"(pVal>{BETA_P_VALUE_THRESHOLD:.2f} "
-                    f"o R²<{MIN_OLS_R_SQUARED_THRESHOLD:.2f})"
+                    f"or R²<{MIN_OLS_R_SQUARED_THRESHOLD:.2f})"
                 ),
             )
-        ax.set_title("Spread Z-Score con Señales de Trading", fontsize=16)
+        ax.set_title("Spread Z-Score with Trading Signals", fontsize=16)
         ax.set_xlabel("Date")
         ax.set_ylabel("Z-Score")
         ax.legend(loc="best")
@@ -1242,7 +1242,7 @@ def plot_results(df_with_indicators, equity_curve, trades_df, plot_dir):
     fig.savefig(os.path.join(plot_dir, "equity_spread_summary.png"))
     plt.close(fig)
 
-    logging.info("Gráfico combinado guardado.")
+    logging.info("Combined plot saved.")
 
 
 def run_walkforward_backtest(df_input, train_days: int, test_days: int, **params):
@@ -1310,13 +1310,13 @@ def run_walkforward_backtest(df_input, train_days: int, test_days: int, **params
     return overall_equity, trades_df
 
 
-# --- Ejecución Principal ---
+# --- Main Execution ---
 if __name__ == "__main__":
-    logging.info("--- INICIO DEL SCRIPT DE BACKTESTING ---")
+    logging.info("--- START OF BACKTESTING SCRIPT ---")
     params = StrategyParameters()
     df_original = load_data(DATA_FILEPATH, params)
     if df_original is not None and not df_original.empty:
-        # Usar OOP wrapper PairTradingBacktester
+        # Use OOP wrapper PairTradingBacktester
         backtester = PairTradingBacktester(params)
         df_processed, equity_curve, trades_summary_df = backtester.run(df_original)
         trades_df_for_metrics = (
@@ -1325,8 +1325,8 @@ if __name__ == "__main__":
         if equity_curve is not None and not equity_curve.empty:
             if (
                 trades_summary_df is not None and not trades_summary_df.empty
-            ):  # Asegurarse que no está vacío
-                # Convertir columnas de fecha/hora a string ANTES de guardar CSV y ANTES de calcular métricas si estas esperan strings
+            ):  # Ensure it is not empty
+                # Convert datetime columns to string BEFORE saving CSV and BEFORE calculating metrics if they expect strings
                 trades_summary_df_csv = trades_summary_df.copy()
                 for col in ["entry_time", "exit_time"]:
                     if (
@@ -1339,10 +1339,10 @@ if __name__ == "__main__":
                             col
                         ].dt.strftime("%Y-%m-%d %H:%M:%S")
                 trades_summary_df_csv.to_csv(TRADES_CSV_FILE, index=False)
-                logging.info(f"Resumen de trades guardado en: {TRADES_CSV_FILE}")
-                # Para métricas y plots, usar el DataFrame con datetimes si es necesario, o el copiado (trades_df_for_metrics)
-                # calculate_performance_metrics espera trades_df, que aquí es trades_df_for_metrics (la copia original del output del backtest)
-                # plot_results también espera trades_df con datetimes para el scatter plot
+                logging.info(f"Trades summary saved to: {TRADES_CSV_FILE}")
+                # For metrics and plots, use the DataFrame with datetimes if necessary, or the copy (trades_df_for_metrics)
+                # calculate_performance_metrics expects trades_df, which here is trades_df_for_metrics (the original copy of the backtest output)
+                # plot_results also expects trades_df with datetimes for the scatter plot
                 metrics = calculate_performance_metrics(
                     equity_curve,
                     trades_df_for_metrics,
@@ -1354,13 +1354,13 @@ if __name__ == "__main__":
                 )
             else:
                 logging.warning(
-                    "No se generaron trades para guardar en CSV o calcular métricas."
+                    "No trades were generated to save to CSV or calculate metrics."
                 )
-                # Aún así, intentar graficar la curva de equity si existe
+                # Still, try to plot the equity curve if it exists
                 plot_results(df_processed, equity_curve, pd.DataFrame(), PLOT_DIR)
 
         else:
-            logging.error("El backtest no produjo una curva de equity válida.")
+            logging.error("Backtest did not produce a valid equity curve.")
     else:
-        logging.error("No se pudieron cargar los datos. Terminando script.")
-    logging.info("--- FIN DEL SCRIPT DE BACKTESTING ---")
+        logging.error("Could not load data. Terminating script.")
+    logging.info("--- END OF BACKTESTING SCRIPT ---")
